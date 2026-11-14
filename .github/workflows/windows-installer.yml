@@ -13,7 +13,6 @@ permissions:
 
 env:
   GSTREAMER_VERSION: "1.24.13"
-  GSTREAMER_ROOT: "C:/gstreamer/1.0/msvc_x86_64"
   QT_VERSION: "6.8.0"
 
 jobs:
@@ -59,9 +58,25 @@ jobs:
               throw "msiexec $msi failed with exit $($p.ExitCode)"
             }
           }
-          if (-not (Test-Path "$env:GSTREAMER_ROOT/include/gstreamer-1.0")) {
-            throw "GSTREAMER_ROOT not found at $env:GSTREAMER_ROOT"
+          $candidates = @(
+            "C:\gstreamer\1.0\msvc_x86_64",
+            "C:\Program Files\gstreamer\1.0\msvc_x86_64",
+            "C:\Program Files\gstreamer\1.0\x86_64"
+          )
+          $found = $null
+          foreach ($c in $candidates) {
+            if (Test-Path (Join-Path $c "include\gstreamer-1.0")) {
+              $found = $c
+              break
+            }
           }
+          if (-not $found) {
+            Get-ChildItem -Path "C:\gstreamer","C:\Program Files\gstreamer" -ErrorAction SilentlyContinue | Format-List
+            throw "Could not locate GStreamer prefix after MSI install"
+          }
+          $root = $found -replace '\\','/'
+          "GSTREAMER_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "GSTREAMER_ROOT=$root"
 
       - name: Optionally fetch ATEM SDK (build-time only)
         env:
