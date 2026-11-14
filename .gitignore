@@ -1,0 +1,31 @@
+# Build
+build/
+cmake-build-*/
+*.user
+CMakeCache.txt
+CMakeFiles/
+Makefile
+compile_commands.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# ATEM SDK (do not commit — Blackmagic license)
+third_party/atem-sdk/
+ATEM_SDK_DIR/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Artifacts
+*.png
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.dll
