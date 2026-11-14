@@ -225,8 +225,8 @@ if(WIN32 AND BUILD_WINDOWS_INSTALLER)
     set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
     set(CPACK_PACKAGE_FILE_NAME
         "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-win64-${ATEM_BUILD_VARIANT}")
-    set(CPACK_NSIS_INCLUDES "${CMAKE_SOURCE_DIR}/cmake/nsis/AtemRuntimeWarning.nsh")
-    set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS "!insertmacro AtemRuntimeInstallWarning")
+    # Custom NSIS warning macro (cmake/nsis/AtemRuntimeWarning.nsh) can be wired via
+    # CPACK_NSIS_INCLUDES when makensis on the target CI image accepts the script.
     if(CMAKE_CONFIGURATION_TYPES)
         set(CPACK_INSTALL_CMAKE_PROJECTS "${PROJECT_NAME};ALL;ALL;")
     else()
