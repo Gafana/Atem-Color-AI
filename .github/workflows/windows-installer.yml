@@ -90,6 +90,9 @@ jobs:
           "GSTREAMER_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "GSTREAMER_ROOT=$root"
 
+      - name: Setup MSVC toolchain
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Optionally fetch ATEM SDK (build-time only)
         env:
           ATEM_SDK_URL: ${{ secrets.ATEM_SDK_URL }}
