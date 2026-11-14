@@ -143,7 +143,13 @@ jobs:
       - name: Create NSIS installer (CPack)
         run: |
           set -euo pipefail
-          cmake --build build --target package
+          cmake --build build --target package || {
+            if [[ -f build/_CPack_Packages/win64/NSIS/NSISOutput.log ]]; then
+              echo "---- NSISOutput.log ----"
+              cat build/_CPack_Packages/win64/NSIS/NSISOutput.log
+            fi
+            exit 1
+          }
           mkdir -p dist
           shopt -s nullglob
           installers=(build/AtemColorAI-*.exe)

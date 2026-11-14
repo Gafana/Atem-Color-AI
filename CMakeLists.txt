@@ -225,8 +225,11 @@ if(WIN32 AND BUILD_WINDOWS_INSTALLER)
     set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
     set(CPACK_PACKAGE_FILE_NAME
         "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-win64-${ATEM_BUILD_VARIANT}")
-    set(CPACK_NSIS_INCLUDES "${CMAKE_SOURCE_DIR}/cmake/nsis/AtemRuntimeWarning.nsh")
-    set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS "!insertmacro AtemRuntimeInstallWarning")
+    set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS
+        "IfFileExists \"$PROGRAMFILES32\\Blackmagic Design\\Blackmagic ATEM Switchers\\BMDSwitcherAPI.dll\" atemwarn_done
+        IfFileExists \"$PROGRAMFILES\\Blackmagic Design\\Blackmagic ATEM Switchers\\BMDSwitcherAPI.dll\" atemwarn_done
+        MessageBox MB_OK|MB_ICONEXCLAMATION \"Blackmagic ATEM Switchers was not detected. Install ATEM Software Control from https://www.blackmagicdesign.com/support/family/atem-live-production-switchers before connecting to a live ATEM.\"
+        atemwarn_done:")
     if(CMAKE_CONFIGURATION_TYPES)
         set(CPACK_INSTALL_CMAKE_PROJECTS "${PROJECT_NAME};ALL;ALL;")
     else()

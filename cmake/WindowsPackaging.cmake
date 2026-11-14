@@ -48,19 +48,25 @@ function(install_gstreamer_bundle _gst_root)
         return()
     endif()
 
-    # Core runtime DLLs next to the application (simplifies PATH for gst_init).
+    set(_bundle_plugins
+        gstcoreelements.dll gstvideoconvert.dll gstvideotestsrc.dll gstapp.dll
+        gstpng.dll gstsrt.dll gsttypefindfunctions.dll gstplayback.dll
+        gstvideoparsersbad.dll gstjpeg.dll gstdshow.dll gstdecklink.dll
+        gstcoretracers.dll gstpango.dll
+    )
+    foreach(_plug IN LISTS _bundle_plugins)
+        if(EXISTS "${_gst_plugins}/${_plug}")
+            install(FILES "${_gst_plugins}/${_plug}"
+                    DESTINATION gstreamer/lib/gstreamer-1.0)
+        endif()
+    endforeach()
+
     file(GLOB _gst_core_dlls
         "${_gst_bin}/gst*.dll"
         "${_gst_bin}/libg*.dll"
         "${_gst_bin}/libgcc*.dll"
         "${_gst_bin}/libwinpthread*.dll"
     )
-    install(FILES ${_gst_core_dlls} DESTINATION bin OPTIONAL)
-
-    install(DIRECTORY "${_gst_plugins}/"
-            DESTINATION gstreamer/lib/gstreamer-1.0
-            FILES_MATCHING
-            PATTERN "*.dll")
 
     if(EXISTS "${_gst_libexec}")
         install(DIRECTORY "${_gst_libexec}/"
