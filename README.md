@@ -13,6 +13,24 @@
 
 Подробная математика: [docs/color-matching.md](docs/color-matching.md).
 
+## Установка (Windows, GitHub Release)
+
+1. Скачайте **`.exe`-инсталлятор** из [Releases](https://github.com/Gafana/Atem-Color-AI/releases) (имя содержит `win64-mock` или `win64-atem-sdk` — вариант сборки, не содержимое инсталлятора).
+2. **Обязательно** установите [Blackmagic ATEM Switchers / ATEM Software Control](https://www.blackmagicdesign.com/support/family/atem-live-production-switchers) — без него COM-сервер `BMDSwitcherAPI` недоступен, и приложение не сможет подключиться к пульту (при установке нашего инсталлятора показывается предупреждение, если Blackmagic ПО не найдено).
+3. Запустите **Atem Color AI** из меню Пуск.
+
+### Что внутри Windows-инсталлятора
+
+| Компонент | Включено |
+|-----------|----------|
+| `atem-color-ai.exe` (GUI + CLI) | да |
+| Qt DLL и платформенные плагины (`windeployqt`) | да |
+| Среда выполнения **GStreamer** (DLL + плагины в `gstreamer/`, `GST_PLUGIN_PATH` настраивается при старте) | да |
+| Распространяемые библиотеки **MSVC** | да |
+| Файлы **Blackmagic ATEM SDK** или ATEM Software Control | **нет** |
+
+Лицензия SDK: [docs/atem-sdk-license-notes.md](docs/atem-sdk-license-notes.md).
+
 ## Требования
 
 | Компонент | Примечание |
@@ -21,6 +39,7 @@
 | Qt 6 или 5.15+ | Core, Gui, Widgets (GUI), Test |
 | ATEM SDK | Windows/macOS, не в git |
 | GStreamer 1.x | опционально |
+| Windows: ATEM Software Control | для реального ATEM (COM), не поставляется с нашим инсталлятором |
 
 ## Сборка (Linux, mock)
 
@@ -32,6 +51,33 @@ cmake -B build -DENABLE_GSTREAMER=ON -DENABLE_GUI=ON -DBUILD_TESTING=ON
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+## Сборка (Windows, локально)
+
+Требуется: Visual Studio 2022, Qt 6, GStreamer MSVC (`GSTREAMER_ROOT`), опционально распакованный ATEM SDK (`ATEM_SDK_DIR`), **NSIS** для CPack.
+
+```powershell
+cmake -B build -G "Visual Studio 17 2022" -A x64 `
+  -DENABLE_GUI=ON -DENABLE_GSTREAMER=ON -DBUILD_WINDOWS_INSTALLER=ON `
+  -DCMAKE_PREFIX_PATH="C:\Qt\6.8.0\msvc2022_64" `
+  -DGSTREAMER_ROOT="C:\gstreamer\1.0\msvc_x86_64" `
+  -DATEM_SDK_DIR="D:\SDK\Blackmagic ATEM Switchers SDK 11.0.1"
+
+cmake --build build --config Release
+cmake --build build --config Release --target package
+```
+
+Инсталлятор: `build\AtemColorAI-<version>-win64-mock.exe` или `...-atem-sdk.exe`.
+
+## CI и секрет `ATEM_SDK_URL`
+
+Workflow [`.github/workflows/windows-installer.yml`](.github/workflows/windows-installer.yml):
+
+- `pull_request` → сборка + артефакт инсталлятора;
+- тег `v*` → pre-release с инсталлятором;
+- `workflow_dispatch`.
+
+Если в настройках репозитория задан секрет **`ATEM_SDK_URL`** (приватная ссылка на zip SDK), CI скачивает SDK, запускает `midl` по `BMDSwitcherAPI.idl` и собирает с `HAVE_ATEM_SDK`. Файлы SDK **не** попадают в инсталлятор. Без секрета — сборка **mock**, суффикс `win64-mock` в имени файла.
 
 ## Запуск
 
@@ -70,11 +116,12 @@ src/
   atem/            — AtemClient, Camera Control, mock/SDK
   capture/         — GStreamer appsink
   gui/             — Qt Widgets (ENABLE_GUI)
+  platform/        — проверка ATEM runtime, пути GStreamer (Windows)
   main.cpp         — CLI + GUI entry
-tests/
-  tst_coloranalysis.cpp
+cmake/
+  WindowsPackaging.cmake, AtemSdkMidl.cmake, nsis/
 docs/
-  color-matching.md
+  color-matching.md, atem-sdk-license-notes.md
 ```
 
 ## Ограничения

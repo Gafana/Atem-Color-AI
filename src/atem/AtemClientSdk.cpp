@@ -1,6 +1,7 @@
 #include "AtemClient.h"
 #include "AtemCorrectionApply.h"
 #include "CameraControlProtocol.h"
+#include "platform/AtemRuntime.h"
 
 #ifdef HAVE_ATEM_SDK
 
@@ -150,6 +151,8 @@ public:
         hr = m_discovery ? S_OK : E_FAIL;
 #endif
         if (FAILED(hr) || !m_discovery) {
+            if (!AtemRuntime::isBlackmagicAtemRuntimeAvailable())
+                return AtemRuntime::missingRuntimeUserMessage();
             return QStringLiteral("Failed to create IBMDSwitcherDiscovery (HRESULT 0x%1)")
                 .arg(static_cast<quint32>(hr), 8, 16, QChar('0'));
         }

@@ -10,7 +10,9 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 option(ENABLE_GUI "Build Qt Widgets GUI shell" OFF)
 option(ENABLE_GSTREAMER "Enable GStreamer frame capture module" ON)
 option(BUILD_TESTING "Build unit tests" ON)
+option(BUILD_WINDOWS_INSTALLER "Configure CPack NSIS installer (Windows)" OFF)
 set(ATEM_SDK_DIR "" CACHE PATH "Path to locally installed Blackmagic ATEM Switchers SDK")
+set(GSTREAMER_ROOT "" CACHE PATH "GStreamer MSVC prefix for Windows bundling (e.g. C:/gstreamer/1.0/msvc_x86_64)")
 
 set(QT_MIN_VERSION 5.15)
 find_package(Qt6 COMPONENTS Core Gui Widgets Test QUIET)
@@ -34,14 +36,44 @@ if(ENABLE_GUI)
 endif()
 
 find_package(ATEMSDK QUIET)
+
+set(ATEMSDK_MIDL_TARGET "")
+if(WIN32 AND ATEM_SDK_DIR AND NOT ATEMSDK_FOUND)
+    include(AtemSdkMidl)
+    atem_sdk_find_idl("${ATEM_SDK_DIR}" ATEM_SDK_IDL)
+    if(ATEM_SDK_IDL)
+        enable_language(C)
+        atem_sdk_add_midl_target("${ATEM_SDK_IDL}" "${CMAKE_BINARY_DIR}/atem_midl")
+        set(ATEMSDK_FOUND TRUE)
+        set(ATEMSDK_INCLUDE_DIR "${ATEMSDK_MIDL_INCLUDE_DIR}")
+        set(ATEMSDK_PLATFORM "WIN32_MIDL")
+        if(NOT TARGET ATEMSDK::ATEMSDK)
+            add_library(ATEMSDK::ATEMSDK INTERFACE IMPORTED)
+            set_target_properties(ATEMSDK::ATEMSDK PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${ATEMSDK_INCLUDE_DIR}")
+        endif()
+        message(STATUS "ATEM SDK IDL found — MIDL headers: ${ATEMSDK_INCLUDE_DIR}")
+    endif()
+endif()
+
 if(ATEMSDK_FOUND)
     message(STATUS "ATEM SDK found (${ATEMSDK_PLATFORM}): ${ATEMSDK_INCLUDE_DIR}")
 else()
     message(STATUS "ATEM SDK not found — building with mock AtemClient (set -DATEM_SDK_DIR=...)")
 endif()
 
+if(ATEMSDK_FOUND)
+    set(ATEM_BUILD_VARIANT "atem-sdk")
+else()
+    set(ATEM_BUILD_VARIANT "mock")
+endif()
+
 set(HAVE_GSTREAMER OFF)
 if(ENABLE_GSTREAMER)
+    if(WIN32 AND GSTREAMER_ROOT)
+        set(ENV{PKG_CONFIG_PATH}
+            "${GSTREAMER_ROOT}/lib/pkgconfig;${GSTREAMER_ROOT}/lib/gstreamer-1.0/pkgconfig")
+    endif()
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
         pkg_check_modules(GSTREAMER QUIET gstreamer-1.0 gstreamer-app-1.0)
@@ -49,6 +81,19 @@ if(ENABLE_GSTREAMER)
             set(HAVE_GSTREAMER ON)
             message(STATUS "GStreamer found: ${GSTREAMER_VERSION}")
         endif()
+    endif()
+    if(NOT HAVE_GSTREAMER AND WIN32 AND GSTREAMER_ROOT AND EXISTS "${GSTREAMER_ROOT}/include/gstreamer-1.0")
+        set(HAVE_GSTREAMER ON)
+        set(GSTREAMER_INCLUDE_DIRS
+            "${GSTREAMER_ROOT}/include/gstreamer-1.0"
+            "${GSTREAMER_ROOT}/include/glib-2.0"
+            "${GSTREAMER_ROOT}/lib/glib-2.0/include")
+        set(GSTREAMER_LIBRARIES
+            "${GSTREAMER_ROOT}/lib/gstreamer-1.0.lib"
+            "${GSTREAMER_ROOT}/lib/gstapp-1.0.lib"
+            "${GSTREAMER_ROOT}/lib/glib-2.0.lib"
+            "${GSTREAMER_ROOT}/lib/gobject-2.0.lib")
+        message(STATUS "GStreamer (manual GSTREAMER_ROOT): ${GSTREAMER_ROOT}")
     endif()
     if(NOT HAVE_GSTREAMER)
         message(STATUS "GStreamer not found — capture module disabled (install libgstreamer1.0-dev)")
@@ -77,7 +122,16 @@ set(APP_SOURCES
     src/atem/AtemClient.h
     src/atem/AtemClientFactory.cpp
     src/atem/AtemClientMock.cpp
+    src/platform/AtemRuntime.h
+    src/platform/AtemRuntime.cpp
 )
+
+if(WIN32)
+    list(APPEND APP_SOURCES
+        src/platform/WindowsBundledPaths.h
+        src/platform/WindowsBundledPaths.cpp
+    )
+endif()
 
 if(ATEMSDK_FOUND)
     list(APPEND APP_SOURCES src/atem/AtemClientSdk.cpp)
@@ -119,6 +173,9 @@ if(ATEMSDK_FOUND)
     if(WIN32)
         target_compile_definitions(atem-color-ai PRIVATE ATEM_SDK_WIN32)
         target_link_libraries(atem-color-ai PRIVATE ole32 oleaut32)
+        if(ATEMSDK_MIDL_TARGET)
+            target_link_libraries(atem-color-ai PRIVATE "${ATEMSDK_MIDL_TARGET}")
+        endif()
     elseif(APPLE)
         find_library(ATEM_COREFOUNDATION CoreFoundation REQUIRED)
         target_link_libraries(atem-color-ai PRIVATE "${ATEM_COREFOUNDATION}")
@@ -133,6 +190,47 @@ if(HAVE_GSTREAMER)
 endif()
 
 install(TARGETS atem-color-ai RUNTIME DESTINATION bin)
+
+if(WIN32 AND BUILD_WINDOWS_INSTALLER)
+    include(WindowsPackaging)
+
+    install(PROGRAMS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS} DESTINATION bin)
+
+    install_windeployqt("atem-color-ai.exe")
+
+    if(GSTREAMER_ROOT)
+        install_gstreamer_bundle("${GSTREAMER_ROOT}")
+    elseif(DEFINED ENV{GSTREAMER_ROOT})
+        install_gstreamer_bundle("$ENV{GSTREAMER_ROOT}")
+    endif()
+
+    install(FILES
+        "${CMAKE_SOURCE_DIR}/cmake/nsis/AtemRuntimeWarning.nsh"
+        DESTINATION share/nsis)
+
+    set(CPACK_GENERATOR "NSIS")
+    set(CPACK_PACKAGE_NAME "AtemColorAI")
+    set(CPACK_PACKAGE_VENDOR "Gafana")
+    set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "ATEM camera color matching for Windows")
+    set(CPACK_PACKAGE_INSTALL_DIRECTORY "Atem Color AI")
+    set(CPACK_PACKAGE_INSTALL_REGISTRY_KEY "AtemColorAI")
+    set(CPACK_NSIS_DISPLAY_NAME "Atem Color AI")
+    set(CPACK_NSIS_PACKAGE_NAME "Atem Color AI")
+    set(CPACK_NSIS_HELP_LINK
+        "https://www.blackmagicdesign.com/support/family/atem-live-production-switchers")
+    set(CPACK_NSIS_URL_INFO_ABOUT "https://github.com/Gafana/Atem-Color-AI")
+    set(CPACK_NSIS_CONTACT "https://github.com/Gafana/Atem-Color-AI")
+    set(CPACK_NSIS_MODIFY_PATH ON)
+    set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+    set(CPACK_PACKAGE_FILE_NAME
+        "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-win64-${ATEM_BUILD_VARIANT}")
+    set(CPACK_NSIS_INCLUDES "${CMAKE_SOURCE_DIR}/cmake/nsis/AtemRuntimeWarning.nsh")
+    set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS "!insertmacro AtemRuntimeInstallWarning")
+    set(CPACK_INSTALL_CMAKE_PROJECTS "${PROJECT_NAME};ALL;ALL;")
+
+    include(CPack)
+endif()
 
 if(BUILD_TESTING)
     enable_testing()
