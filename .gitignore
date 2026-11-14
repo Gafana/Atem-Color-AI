@@ -14,7 +14,7 @@ compile_commands.json
 *~
 
 # ATEM SDK (do not commit — Blackmagic license)
-third_party/atem-sdk/
+third_party/
 ATEM_SDK_DIR/
 
 # OS

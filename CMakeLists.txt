@@ -62,6 +62,10 @@ set(SOURCES
 
 if(ATEMSDK_FOUND)
     list(APPEND SOURCES src/atem/AtemClientSdk.cpp)
+    if(ATEMSDK_DISPATCH_CPP)
+        list(APPEND SOURCES "${ATEMSDK_DISPATCH_CPP}")
+        message(STATUS "ATEM SDK dispatch: ${ATEMSDK_DISPATCH_CPP}")
+    endif()
 endif()
 
 if(HAVE_GSTREAMER)
@@ -85,6 +89,9 @@ if(ATEMSDK_FOUND)
     if(WIN32)
         target_compile_definitions(atem-color-ai PRIVATE ATEM_SDK_WIN32)
         target_link_libraries(atem-color-ai PRIVATE ole32 oleaut32)
+    elseif(APPLE)
+        find_library(ATEM_COREFOUNDATION CoreFoundation REQUIRED)
+        target_link_libraries(atem-color-ai PRIVATE "${ATEM_COREFOUNDATION}")
     endif()
 endif()
 

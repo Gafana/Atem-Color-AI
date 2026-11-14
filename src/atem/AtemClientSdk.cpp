@@ -5,11 +5,11 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <comdef.h>
+#else
+#include <CoreFoundation/CoreFoundation.h>
 #endif
 
 #include "BMDSwitcherAPI.h"
-
-#include <QDebug>
 
 namespace {
 
@@ -30,20 +30,52 @@ QString portTypeToString(BMDSwitcherPortType type)
         return QStringLiteral("MediaPlayerCut");
     case bmdSwitcherPortTypeSuperSource:
         return QStringLiteral("SuperSource");
-    case bmdSwitcherPortTypeMixEffect:
-        return QStringLiteral("MixEffect");
+    case bmdSwitcherPortTypeMixEffectBlockOutput:
+        return QStringLiteral("MixEffectBlockOutput");
     case bmdSwitcherPortTypeAuxOutput:
         return QStringLiteral("AuxOutput");
-    case bmdSwitcherPortTypeMultiView:
-        return QStringLiteral("MultiView");
+    case bmdSwitcherPortTypeKeyCutOutput:
+        return QStringLiteral("KeyCutOutput");
+    case bmdSwitcherPortTypeMultiview:
+        return QStringLiteral("Multiview");
+    case bmdSwitcherPortTypeAudioMonitor:
+        return QStringLiteral("AudioMonitor");
     case bmdSwitcherPortTypeExternalDirect:
         return QStringLiteral("ExternalDirect");
-    case bmdSwitcherPortTypeFrameSync:
-        return QStringLiteral("FrameSync");
-    case bmdSwitcherPortTypeInput:
-        return QStringLiteral("Input");
     default:
         return QStringLiteral("Unknown");
+    }
+}
+
+QString externalPortTypeToString(BMDSwitcherExternalPortType type)
+{
+    switch (type) {
+    case bmdSwitcherExternalPortTypeSDI:
+        return QStringLiteral("SDI");
+    case bmdSwitcherExternalPortTypeHDMI:
+        return QStringLiteral("HDMI");
+    case bmdSwitcherExternalPortTypeComponent:
+        return QStringLiteral("Component");
+    case bmdSwitcherExternalPortTypeComposite:
+        return QStringLiteral("Composite");
+    case bmdSwitcherExternalPortTypeSVideo:
+        return QStringLiteral("S-Video");
+    case bmdSwitcherExternalPortTypeInternal:
+        return QStringLiteral("Internal");
+    case bmdSwitcherExternalPortTypeXLR:
+        return QStringLiteral("XLR");
+    case bmdSwitcherExternalPortTypeAESEBU:
+        return QStringLiteral("AES/EBU");
+    case bmdSwitcherExternalPortTypeRCA:
+        return QStringLiteral("RCA");
+    case bmdSwitcherExternalPortTypeTSJack:
+        return QStringLiteral("TS Jack");
+    case bmdSwitcherExternalPortTypeMADI:
+        return QStringLiteral("MADI");
+    case bmdSwitcherExternalPortTypeTRS:
+        return QStringLiteral("TRS");
+    default:
+        return QStringLiteral("External");
     }
 }
 
@@ -55,13 +87,31 @@ QString fromBstr(BSTR bstr)
     return QString::fromWCharArray(bstr);
 }
 #else
-QString fromUtf8(const char *utf8)
+QString fromCfString(CFStringRef value)
 {
-    if (!utf8)
+    if (!value)
         return {};
-    return QString::fromUtf8(utf8);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    return QString::fromCFString(value);
+#else
+    char buffer[512];
+    if (CFStringGetCString(value, buffer, sizeof(buffer), kCFStringEncodingUTF8))
+        return QString::fromUtf8(buffer);
+    return {};
+#endif
 }
 #endif
+
+QString formatPortLabel(BMDSwitcherPortType portType, IBMDSwitcherInput *input)
+{
+    QString label = portTypeToString(portType);
+    if (portType == bmdSwitcherPortTypeExternal && input) {
+        BMDSwitcherExternalPortType ext = {};
+        if (SUCCEEDED(input->GetCurrentExternalPortType(&ext)))
+            label += QStringLiteral(" (%1)").arg(externalPortTypeToString(ext));
+    }
+    return label;
+}
 
 } // namespace
 
@@ -104,10 +154,14 @@ public:
 
         BMDSwitcherConnectToFailure failReason = bmdSwitcherConnectToFailureNoResponse;
 #ifdef _WIN32
-        hr = m_discovery->ConnectTo(_bstr_t(address.toStdWString().c_str()),
-                                    &m_switcher, &failReason);
+        hr = m_discovery->ConnectTo(_bstr_t(address.toStdWString().c_str()), &m_switcher, &failReason);
 #else
-        hr = m_discovery->ConnectTo(address.toUtf8().constData(), &m_switcher, &failReason);
+        CFStringRef cfAddress =
+            CFStringCreateWithCString(kCFAllocatorDefault, address.toUtf8().constData(),
+                                      kCFStringEncodingUTF8);
+        hr = m_discovery->ConnectTo(cfAddress, &m_switcher, &failReason);
+        if (cfAddress)
+            CFRelease(cfAddress);
 #endif
         if (FAILED(hr) || !m_switcher) {
             return QStringLiteral("ConnectTo failed: %1 (HRESULT 0x%2)")
@@ -115,12 +169,14 @@ public:
                 .arg(static_cast<quint32>(hr), 8, 16, QChar('0'));
         }
 
+        m_switcherSupportsCameraControl = querySwitcherCameraControl();
         m_address = address;
         return {};
     }
 
     void disconnect() override
     {
+        m_switcherSupportsCameraControl = false;
         if (m_switcher) {
             m_switcher->Release();
             m_switcher = nullptr;
@@ -155,7 +211,7 @@ public:
 
             BMDSwitcherPortType portType = bmdSwitcherPortTypeExternal;
             if (SUCCEEDED(input->GetPortType(&portType)))
-                info.portType = portTypeToString(portType);
+                info.portType = formatPortLabel(portType, input);
 
 #ifdef _WIN32
             BSTR shortName = nullptr;
@@ -170,11 +226,11 @@ public:
             CFStringRef shortName = nullptr;
             CFStringRef longName = nullptr;
             if (SUCCEEDED(input->GetShortName(&shortName)) && shortName) {
-                info.shortName = fromUtf8(CFStringGetCStringPtr(shortName, kCFStringEncodingUTF8));
+                info.shortName = fromCfString(shortName);
                 CFRelease(shortName);
             }
             if (SUCCEEDED(input->GetLongName(&longName)) && longName) {
-                info.longName = fromUtf8(CFStringGetCStringPtr(longName, kCFStringEncodingUTF8));
+                info.longName = fromCfString(longName);
                 CFRelease(longName);
             }
 #endif
@@ -190,6 +246,19 @@ public:
     }
 
 private:
+    bool querySwitcherCameraControl()
+    {
+        IBMDSwitcherCameraControl *cameraControl = nullptr;
+        const HRESULT hr =
+            m_switcher->QueryInterface(IID_IBMDSwitcherCameraControl,
+                                       reinterpret_cast<void **>(&cameraControl));
+        if (SUCCEEDED(hr) && cameraControl) {
+            cameraControl->Release();
+            return true;
+        }
+        return false;
+    }
+
     static QString connectFailureString(BMDSwitcherConnectToFailure reason)
     {
         switch (reason) {
@@ -201,29 +270,26 @@ private:
             return QStringLiteral("corrupt data");
         case bmdSwitcherConnectToFailureStateSync:
             return QStringLiteral("state sync failed");
-        case bmdSwitcherConnectToFailureStateSyncTimedout:
+        case bmdSwitcherConnectToFailureStateSyncTimedOut:
             return QStringLiteral("state sync timed out");
         default:
             return QStringLiteral("unknown");
         }
     }
 
-    static bool checkCameraControl(IBMDSwitcherInput *input)
+    bool checkCameraControl(IBMDSwitcherInput *input) const
     {
-        if (!input)
+        if (!input || !m_switcherSupportsCameraControl)
             return false;
-        IBMDSwitcherCameraControl *cameraControl = nullptr;
-        HRESULT hr = input->QueryInterface(IID_IBMDSwitcherCameraControl,
-                                           reinterpret_cast<void **>(&cameraControl));
-        if (SUCCEEDED(hr) && cameraControl) {
-            cameraControl->Release();
+        bool supportsModel = false;
+        if (SUCCEEDED(input->DoesSupportCameraModel(&supportsModel)) && supportsModel)
             return true;
-        }
         return false;
     }
 
     IBMDSwitcherDiscovery *m_discovery = nullptr;
     IBMDSwitcher *m_switcher = nullptr;
+    bool m_switcherSupportsCameraControl = false;
     QString m_address;
 };
 
