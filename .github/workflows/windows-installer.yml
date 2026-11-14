@@ -53,25 +53,37 @@ jobs:
           $ErrorActionPreference = "Stop"
           foreach ($msi in @("gst-runtime.msi", "gst-devel.msi")) {
             Write-Host "Installing $msi ..."
-            $p = Start-Process -FilePath msiexec.exe -ArgumentList "/i", $msi, "/qn", "/norestart" -Wait -PassThru
+            $p = Start-Process -FilePath msiexec.exe -ArgumentList @(
+              "/i", $msi, "INSTALLDIR=C:\gstreamer", "/qn", "/norestart"
+            ) -Wait -PassThru
             if ($p.ExitCode -notin 0, 3010) {
               throw "msiexec $msi failed with exit $($p.ExitCode)"
             }
           }
           $candidates = @(
             "C:\gstreamer\1.0\msvc_x86_64",
+            "C:\gstreamer\1.0\msvc_x86",
+            "C:\gstreamer",
             "C:\Program Files\gstreamer\1.0\msvc_x86_64",
             "C:\Program Files\gstreamer\1.0\x86_64"
           )
           $found = $null
           foreach ($c in $candidates) {
-            if (Test-Path (Join-Path $c "include\gstreamer-1.0")) {
+            if (Test-Path (Join-Path $c "include\gstreamer-1.0\gst\gst.h")) {
               $found = $c
               break
             }
           }
           if (-not $found) {
-            Get-ChildItem -Path "C:\gstreamer","C:\Program Files\gstreamer" -ErrorAction SilentlyContinue | Format-List
+            $hit = Get-ChildItem -Path "C:\gstreamer","C:\Program Files" -Filter gst.h -Recurse -Depth 8 -ErrorAction SilentlyContinue `
+              | Where-Object { $_.FullName -match 'include\\gstreamer-1\.0\\gst\\gst\.h' } `
+              | Select-Object -First 1
+            if ($hit) {
+              $found = $hit.Directory.Parent.Parent.Parent.Parent.FullName
+            }
+          }
+          if (-not $found) {
+            Get-ChildItem -Path "C:\gstreamer","C:\Program Files\gstreamer" -ErrorAction SilentlyContinue -Recurse -Depth 4 | Select-Object -First 40
             throw "Could not locate GStreamer prefix after MSI install"
           }
           $root = $found -replace '\\','/'
