@@ -3,7 +3,6 @@
 #ifdef HAVE_GSTREAMER
 
 #include <QImage>
-#include <QFileInfo>
 
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
@@ -19,7 +18,7 @@ QString buildPipeline(const QString &sourceUri)
         src = QStringLiteral("srtsrc uri=\"%1\" ! tsdemux ! decodebin").arg(sourceUri);
     } else if (lower.startsWith(QStringLiteral("ndi"))) {
         src = QStringLiteral("ndisrc name=%1 ! decodebin")
-                  .arg(sourceUri.mid(4).trimmed()); // ndi:SourceName
+                  .arg(sourceUri.mid(4).trimmed());
     } else if (lower.startsWith(QStringLiteral("decklink:"))) {
         const QString device = sourceUri.mid(9).trimmed();
         src = QStringLiteral("decklinkvideosrc device-number=%1 ! decodebin").arg(device);
@@ -29,11 +28,9 @@ QString buildPipeline(const QString &sourceUri)
     } else if (lower.startsWith(QStringLiteral("videotestsrc"))) {
         src = QStringLiteral("videotestsrc num-buffers=1");
     } else {
-        // Assume raw GStreamer element chain for the source
-        src = QStringLiteral("%1").arg(sourceUri);
+        src = sourceUri;
     }
 
-    // appsink path: pull one buffer, save via QImage
     return QStringLiteral("%1 ! videoconvert ! video/x-raw,format=RGB "
                           "! appsink name=sink emit-signals=false max-buffers=1 drop=true")
         .arg(src);
@@ -41,7 +38,7 @@ QString buildPipeline(const QString &sourceUri)
 
 } // namespace
 
-QString GstFrameCapture::capturePng(const QString &sourceUri, const QString &outputPath)
+QString GstFrameCapture::captureFrame(const QString &sourceUri, QImage &out)
 {
     gst_init(nullptr, nullptr);
 
@@ -71,7 +68,7 @@ QString GstFrameCapture::capturePng(const QString &sourceUri, const QString &out
         return QStringLiteral("Failed to set pipeline PLAYING");
     }
 
-  QString err;
+    QString err;
     GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(appsink), 5 * GST_SECOND);
     if (!sample) {
         err = QStringLiteral("Timeout waiting for video frame (5s)");
@@ -79,15 +76,14 @@ QString GstFrameCapture::capturePng(const QString &sourceUri, const QString &out
         GstBuffer *buffer = gst_sample_get_buffer(sample);
         GstCaps *caps = gst_sample_get_caps(sample);
         GstStructure *s = gst_caps_get_structure(caps, 0);
-        int width = 0, height = 0;
+        int width = 0;
+        int height = 0;
         gst_structure_get_int(s, "width", &width);
         gst_structure_get_int(s, "height", &height);
 
         GstMapInfo map;
         if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-            QImage image(map.data, width, height, width * 3, QImage::Format_RGB888);
-            if (!image.save(outputPath, "PNG"))
-                err = QStringLiteral("Failed to write PNG to %1").arg(outputPath);
+            out = QImage(map.data, width, height, width * 3, QImage::Format_RGB888).copy();
             gst_buffer_unmap(buffer, &map);
         } else {
             err = QStringLiteral("Failed to map GStreamer buffer");
@@ -98,8 +94,18 @@ QString GstFrameCapture::capturePng(const QString &sourceUri, const QString &out
     gst_element_set_state(pipeline, GST_STATE_NULL);
     gst_object_unref(appsink);
     gst_object_unref(pipeline);
-
     return err;
+}
+
+QString GstFrameCapture::capturePng(const QString &sourceUri, const QString &outputPath)
+{
+    QImage image;
+    const QString err = captureFrame(sourceUri, image);
+    if (!err.isEmpty())
+        return err;
+    if (!image.save(outputPath, "PNG"))
+        return QStringLiteral("Failed to write PNG to %1").arg(outputPath);
+    return {};
 }
 
 #endif

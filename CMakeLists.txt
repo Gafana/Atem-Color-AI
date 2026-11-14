@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(AtemColorAI VERSION 0.1.0 LANGUAGES CXX)
+project(AtemColorAI VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,20 +7,22 @@ set(CMAKE_AUTOMOC ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-option(ENABLE_GUI "Build Qt Widgets GUI shell (default: console only)" OFF)
+option(ENABLE_GUI "Build Qt Widgets GUI shell" OFF)
 option(ENABLE_GSTREAMER "Enable GStreamer frame capture module" ON)
+option(BUILD_TESTING "Build unit tests" ON)
 set(ATEM_SDK_DIR "" CACHE PATH "Path to locally installed Blackmagic ATEM Switchers SDK")
 
-# Qt6 preferred, Qt5 fallback
 set(QT_MIN_VERSION 5.15)
-find_package(Qt6 COMPONENTS Core Gui Widgets QUIET)
+find_package(Qt6 COMPONENTS Core Gui Widgets Test QUIET)
 if(Qt6_FOUND)
     set(QT_VERSION_MAJOR 6)
-    set(QT_LIBS Qt6::Core)
+    set(QT_LIBS Qt6::Core Qt6::Gui)
+    set(QT_TEST_LIBS Qt6::Test)
 else()
-    find_package(Qt5 ${QT_MIN_VERSION} REQUIRED COMPONENTS Core Gui Widgets)
+    find_package(Qt5 ${QT_MIN_VERSION} REQUIRED COMPONENTS Core Gui Widgets Test)
     set(QT_VERSION_MAJOR 5)
-    set(QT_LIBS Qt5::Core)
+    set(QT_LIBS Qt5::Core Qt5::Gui)
+    set(QT_TEST_LIBS Qt5::Test)
 endif()
 
 if(ENABLE_GUI)
@@ -53,7 +55,24 @@ if(ENABLE_GSTREAMER)
     endif()
 endif()
 
-set(SOURCES
+add_library(atem_color STATIC
+    src/color/ColorTypes.h
+    src/color/ColorAnalysis.h
+    src/color/ColorAnalysis.cpp
+    src/color/ColorMatching.h
+    src/color/ColorMatching.cpp
+    src/atem/CameraControlProtocol.h
+    src/atem/CameraCorrection.h
+    src/atem/CameraCorrection.cpp
+    src/atem/AtemCorrectionApply.h
+    src/atem/AtemCorrectionApply.cpp
+)
+
+target_link_libraries(atem_color PUBLIC ${QT_LIBS})
+target_include_directories(atem_color PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(atem_color PUBLIC QT_NO_KEYWORDS)
+
+set(APP_SOURCES
     src/main.cpp
     src/atem/AtemClient.h
     src/atem/AtemClientFactory.cpp
@@ -61,27 +80,38 @@ set(SOURCES
 )
 
 if(ATEMSDK_FOUND)
-    list(APPEND SOURCES src/atem/AtemClientSdk.cpp)
+    list(APPEND APP_SOURCES src/atem/AtemClientSdk.cpp)
     if(ATEMSDK_DISPATCH_CPP)
-        list(APPEND SOURCES "${ATEMSDK_DISPATCH_CPP}")
+        list(APPEND APP_SOURCES "${ATEMSDK_DISPATCH_CPP}")
         message(STATUS "ATEM SDK dispatch: ${ATEMSDK_DISPATCH_CPP}")
     endif()
 endif()
 
 if(HAVE_GSTREAMER)
-    list(APPEND SOURCES
+    list(APPEND APP_SOURCES
         src/capture/GstFrameCapture.h
         src/capture/GstFrameCapture.cpp
     )
 endif()
 
-add_executable(atem-color-ai ${SOURCES})
+if(ENABLE_GUI)
+    list(APPEND APP_SOURCES
+        src/gui/MainWindow.h
+        src/gui/MainWindow.cpp
+        src/gui/HistogramWidget.h
+        src/gui/HistogramWidget.cpp
+        src/gui/VectorscopeWidget.h
+        src/gui/VectorscopeWidget.cpp
+    )
+endif()
 
-target_link_libraries(atem-color-ai PRIVATE ${QT_LIBS})
+add_executable(atem-color-ai ${APP_SOURCES})
+target_link_libraries(atem-color-ai PRIVATE atem_color ${QT_LIBS})
+target_compile_definitions(atem-color-ai PRIVATE QT_NO_KEYWORDS)
 
-target_compile_definitions(atem-color-ai PRIVATE
-    QT_NO_KEYWORDS
-)
+if(ENABLE_GUI)
+    target_compile_definitions(atem-color-ai PRIVATE ENABLE_GUI)
+endif()
 
 if(ATEMSDK_FOUND)
     target_compile_definitions(atem-color-ai PRIVATE HAVE_ATEM_SDK)
@@ -96,11 +126,6 @@ if(ATEMSDK_FOUND)
 endif()
 
 if(HAVE_GSTREAMER)
-    if(QT_VERSION_MAJOR EQUAL 6)
-        target_link_libraries(atem-color-ai PRIVATE Qt6::Gui)
-    else()
-        target_link_libraries(atem-color-ai PRIVATE Qt5::Gui)
-    endif()
     target_compile_definitions(atem-color-ai PRIVATE HAVE_GSTREAMER)
     target_include_directories(atem-color-ai PRIVATE ${GSTREAMER_INCLUDE_DIRS})
     target_link_libraries(atem-color-ai PRIVATE ${GSTREAMER_LIBRARIES})
@@ -108,3 +133,11 @@ if(HAVE_GSTREAMER)
 endif()
 
 install(TARGETS atem-color-ai RUNTIME DESTINATION bin)
+
+if(BUILD_TESTING)
+    enable_testing()
+    add_executable(tst_coloranalysis tests/tst_coloranalysis.cpp)
+    target_link_libraries(tst_coloranalysis PRIVATE atem_color ${QT_TEST_LIBS})
+    target_compile_definitions(tst_coloranalysis PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME coloranalysis COMMAND tst_coloranalysis)
+endif()

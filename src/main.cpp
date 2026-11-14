@@ -1,8 +1,18 @@
 #include "atem/AtemClient.h"
+#include "color/ColorAnalysis.h"
+#include "color/ColorMatching.h"
 
-#include <QCoreApplication>
 #include <QCommandLineParser>
+#include <QCoreApplication>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLoggingCategory>
+
+#ifdef ENABLE_GUI
+#include <QApplication>
+#include "gui/MainWindow.h"
+#endif
 
 #ifdef HAVE_GSTREAMER
 #include "capture/GstFrameCapture.h"
@@ -24,15 +34,77 @@ static void logInputs(const QVector<AtemInputInfo> &inputs)
     }
 }
 
+static int runAnalyzeCli(const QStringList &paths, bool jsonOutput, float damping)
+{
+    if (paths.size() < 2) {
+        qCCritical(lc) << "analyze requires at least reference.png + one candidate";
+        return 2;
+    }
+
+    QImage refImage;
+    const QString refLoad = ColorAnalysis::loadImage(paths.first(), refImage);
+    if (!refLoad.isEmpty()) {
+        qCCritical(lc) << refLoad;
+        return 3;
+    }
+    const FrameColorAnalysis refAnalysis = ColorAnalysis::analyze(refImage);
+
+    QVector<QPair<QString, FrameColorAnalysis>> candidates;
+    for (int i = 1; i < paths.size(); ++i) {
+        QImage img;
+        const QString err = ColorAnalysis::loadImage(paths[i], img);
+        if (!err.isEmpty()) {
+            qCCritical(lc) << err;
+            return 3;
+        }
+        candidates.push_back({paths[i], ColorAnalysis::analyze(img)});
+    }
+
+    ColorMatchOptions opt;
+    opt.damping = damping;
+    const QVector<CameraMatchResult> results = ColorMatching::matchAll(refAnalysis, candidates, opt);
+
+    if (jsonOutput) {
+        QJsonObject root;
+        root.insert(QStringLiteral("reference"), paths.first());
+        QJsonArray cams;
+        for (const CameraMatchResult &r : results) {
+            QJsonObject o;
+            o.insert(QStringLiteral("source"), r.label);
+            o.insert(QStringLiteral("metrics"),
+                     QJsonObject{{QStringLiteral("deltaLuma"), r.metrics.meanDeltaLuma},
+                                 {QStringLiteral("histogramL1Rgb"), r.metrics.histogramL1Rgb}});
+            o.insert(QStringLiteral("correction"), r.damped.toJson());
+            cams.append(o);
+        }
+        root.insert(QStringLiteral("cameras"), cams);
+        const QByteArray out = QJsonDocument(root).toJson(QJsonDocument::Indented);
+        fprintf(stdout, "%s\n", out.constData());
+    } else {
+        printf("Reference: %s\n", qPrintable(paths.first()));
+        for (const CameraMatchResult &r : results) {
+            printf("\n%s\n", qPrintable(r.label));
+            printf("  deltaLuma=%.2f  L1rgb=%.4f  gainY=%.3f  WB=%d tint=%d  gainDb=%d\n",
+                   r.metrics.meanDeltaLuma, r.metrics.histogramL1Rgb, r.damped.gainY,
+                   r.damped.whiteBalanceKelvin, r.damped.whiteBalanceTint, r.damped.gainDb);
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
+#ifdef ENABLE_GUI
+    QApplication app(argc, argv);
+#else
     QCoreApplication app(argc, argv);
+#endif
     QCoreApplication::setApplicationName(QStringLiteral("atem-color-ai"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.2.0"));
 
     QCommandLineParser parser;
     parser.setApplicationDescription(
-        QStringLiteral("ATEM camera listing and optional GStreamer frame capture"));
+        QStringLiteral("ATEM camera color analysis / matching and optional GStreamer capture"));
     parser.addHelpOption();
     parser.addVersionOption();
 
@@ -50,8 +122,7 @@ int main(int argc, char *argv[])
 
     QCommandLineOption captureSourceOption(
         QStringLiteral("capture"),
-        QStringLiteral("Video source URI for single-frame PNG capture "
-                       "(srt://..., ndi:Name, decklink:N, v4l2:/dev/video0, videotestsrc)"),
+        QStringLiteral("Video source URI for single-frame PNG capture"),
         QStringLiteral("uri"));
     parser.addOption(captureSourceOption);
 
@@ -62,7 +133,49 @@ int main(int argc, char *argv[])
         QStringLiteral("frame.png"));
     parser.addOption(outputOption);
 
+    QCommandLineOption analyzeOption(
+        QStringLiteral("analyze"),
+        QStringLiteral("Analyze PNGs (positional): first = reference, rest = candidates"));
+    parser.addOption(analyzeOption);
+    parser.addPositionalArgument(QStringLiteral("png"),
+                                 QStringLiteral("PNG paths used with --analyze"));
+
+    QCommandLineOption jsonOption(QStringLiteral("json"), QStringLiteral("JSON output for --analyze"));
+    parser.addOption(jsonOption);
+
+    QCommandLineOption dampingOption(
+        QStringLiteral("damping"),
+        QStringLiteral("Partial correction factor 0..1 (default 0.35)"),
+        QStringLiteral("factor"),
+        QStringLiteral("0.35"));
+    parser.addOption(dampingOption);
+
+#ifdef ENABLE_GUI
+    QCommandLineOption guiOption(QStringLiteral("gui"), QStringLiteral("Open Qt Widgets UI"));
+    parser.addOption(guiOption);
+#endif
+
     parser.process(app);
+
+#ifdef ENABLE_GUI
+    if (parser.isSet(guiOption)) {
+        auto client = createAtemClient();
+        const QString ip = parser.value(ipOption);
+        const QString connectError = client->connectTo(ip);
+        if (!connectError.isEmpty())
+            qCWarning(lc) << "ATEM connect failed (UI still opens):" << connectError;
+
+        MainWindow window(std::move(client));
+        window.show();
+        return app.exec();
+    }
+#endif
+
+    if (parser.isSet(analyzeOption)) {
+        const QStringList paths = parser.positionalArguments();
+        const float damping = parser.value(dampingOption).toFloat();
+        return runAnalyzeCli(paths, parser.isSet(jsonOption), damping);
+    }
 
     const QString ip = parser.value(ipOption);
     auto client = createAtemClient();
@@ -79,15 +192,16 @@ int main(int argc, char *argv[])
     logInputs(client->listInputs());
     client->disconnect();
 
+    if (parser.isSet(listOnlyOption) && !parser.isSet(captureSourceOption))
+        return 0;
+
     if (parser.isSet(captureSourceOption)) {
 #ifndef HAVE_GSTREAMER
-        qCCritical(lc) << "GStreamer support was not built (install dev packages, reconfigure with "
-                          "-DENABLE_GSTREAMER=ON)";
+        qCCritical(lc) << "GStreamer support was not built";
         return 2;
 #else
         const QString source = parser.value(captureSourceOption);
         const QString outPath = parser.value(outputOption);
-        qCInfo(lc) << "Capturing one frame from" << source << "->" << outPath;
         const QString capErr = GstFrameCapture::capturePng(source, outPath);
         if (!capErr.isEmpty()) {
             qCCritical(lc) << "Capture failed:" << capErr;
