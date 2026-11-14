@@ -24,12 +24,14 @@
 SDK **нельзя** коммитить в git (лицензия Blackmagic).
 
 1. Скачайте с сайта Blackmagic: [Support → Software → ATEM Switchers SDK](https://www.blackmagicdesign.com/developer/products/atem/sdk-and-software) (раздел **ATEM Switchers SDK**).
-2. Распакуйте локально, например в `third_party/atem-sdk/` (эта папка в `.gitignore`).
-3. Укажите путь при конфигурации CMake:
+2. Распакуйте локально, например в `third_party/atem-sdk/` (каталог `third_party/` в `.gitignore`).
+3. Укажите **корень** распакованного архива (например `Blackmagic ATEM Switchers SDK 11.0.1`) при конфигурации CMake:
 
 ```bash
-cmake -B build -DATEM_SDK_DIR="/path/to/ATEM Switchers SDK 9.x"
+cmake -B build -DATEM_SDK_DIR="$PWD/third_party/atem-sdk/Blackmagic ATEM Switchers SDK 11.0.1"
 ```
+
+Внутри архива 11.x ожидаются каталоги `Mac OS X/include/` (заголовки + `BMDSwitcherAPIDispatch.cpp`) и `Windows/include/` (`BMDSwitcherAPI.idl`; для C++ также можно использовать сгенерированный `Windows/Samples/DeviceInfo/BMDSwitcherAPI.h` после MIDL).
 
 **Платформы SDK:**
 
