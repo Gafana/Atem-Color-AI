@@ -102,6 +102,29 @@ GUI:
 ./build/atem-color-ai --gui -i 192.168.10.240
 ```
 
+## Первый запуск и настройки
+
+При первом запуске **GUI** (пока в настройках не выставлен флаг `firstRunDone`) открывается диалог **«Настройка путей ATEM»**:
+
+| Поле | Назначение |
+|------|------------|
+| **Путь к ATEM SDK** | Каталог с распакованным Blackmagic ATEM Switchers SDK (`BMDSwitcherAPI.h` / `.idl`, часто в подкаталоге `Win/`). Нужен в основном для **сборки** (MIDL) и **диагностики** в рантайме; в инсталлятор SDK не входит. |
+| **ATEM Software Control** | Папка установки Blackmagic ATEM Switchers или `ATEM Software Control.exe`. Через `BMDSwitcherAPI.dll` и зарегистрированный COM-сервер приложение подключается к пульту. |
+
+Кнопки **«Обзор…»**, **«Автоопределение»** (реестр / типовые пути `Program Files\Blackmagic Design\Blackmagic ATEM Switchers`, переменная `ATEM_SDK_DIR` при сборке), индикаторы валидности, **«Сохранить»** и **«Пропустить»**.
+
+**Хранение:** файл INI в каталоге `QStandardPaths::AppConfigLocation` (Windows: `%AppData%\<org>\<app>\settings.ini`). Ключи: `atem/sdkPath`, `atem/softwareControlPath`, `atem/firstRunDone`.
+
+Пути можно сменить в меню **«Настройки → Пути ATEM…»** или из CLI (значения записываются в тот же INI):
+
+```bash
+./build/atem-color-ai --sdk-path "D:/SDK/Blackmagic ATEM Switchers SDK 11.0.1" \
+  --atem-control-path "C:/Program Files (x86)/Blackmagic Design/Blackmagic ATEM Switchers"
+./build/atem-color-ai --reset-settings
+```
+
+Если путь к **ATEM Software Control** не задан или неверен, приложение **не завершается**: в главном окне показывается предупреждение, **«Применить поправки»** отключена; анализ PNG и GStreamer доступны. В CLI выводится предупреждение в лог (`atem.setup`).
+
 Захват кадра:
 
 ```bash
@@ -115,8 +138,8 @@ src/
   color/           — анализ и сведение
   atem/            — AtemClient, Camera Control, mock/SDK
   capture/         — GStreamer appsink
-  gui/             — Qt Widgets (ENABLE_GUI)
-  platform/        — проверка ATEM runtime, пути GStreamer (Windows)
+  gui/             — AtemPathsSetupDialog, MainWindow (ENABLE_GUI)
+  platform/        — QSettings (пути ATEM), валидация, ATEM runtime, GStreamer (Windows)
   main.cpp         — CLI + GUI entry
 cmake/
   WindowsPackaging.cmake, AtemSdkMidl.cmake, nsis/

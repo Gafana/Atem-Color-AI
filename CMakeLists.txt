@@ -122,8 +122,14 @@ set(APP_SOURCES
     src/atem/AtemClient.h
     src/atem/AtemClientFactory.cpp
     src/atem/AtemClientMock.cpp
+    src/platform/AtemAppSettings.h
+    src/platform/AtemAppSettings.cpp
+    src/platform/AtemPathValidation.h
+    src/platform/AtemPathValidation.cpp
     src/platform/AtemRuntime.h
     src/platform/AtemRuntime.cpp
+    src/platform/AtemSetup.h
+    src/platform/AtemSetup.cpp
 )
 
 if(WIN32)
@@ -150,6 +156,8 @@ endif()
 
 if(ENABLE_GUI)
     list(APPEND APP_SOURCES
+        src/gui/AtemPathsSetupDialog.h
+        src/gui/AtemPathsSetupDialog.cpp
         src/gui/MainWindow.h
         src/gui/MainWindow.cpp
         src/gui/HistogramWidget.h
@@ -242,4 +250,12 @@ if(BUILD_TESTING)
     target_link_libraries(tst_coloranalysis PRIVATE atem_color ${QT_TEST_LIBS})
     target_compile_definitions(tst_coloranalysis PRIVATE QT_NO_KEYWORDS)
     add_test(NAME coloranalysis COMMAND tst_coloranalysis)
+
+    add_executable(tst_atem_paths tests/tst_atem_paths.cpp
+        src/platform/AtemAppSettings.cpp
+        src/platform/AtemPathValidation.cpp)
+    target_include_directories(tst_atem_paths PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(tst_atem_paths PRIVATE ${QT_LIBS} ${QT_TEST_LIBS})
+    target_compile_definitions(tst_atem_paths PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME atem_paths COMMAND tst_atem_paths)
 endif()

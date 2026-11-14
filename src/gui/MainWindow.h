@@ -11,6 +11,8 @@ class AtemClient;
 class HistogramWidget;
 class QTableWidget;
 class QComboBox;
+class QLabel;
+class QPushButton;
 class VectorscopeWidget;
 
 class MainWindow final : public QMainWindow
@@ -39,6 +41,8 @@ private:
     bool loadFrameForCamera(int index, QImage &image);
     void refreshCorrectionsTable();
     void updatePlots();
+    void rebuildAtemAvailabilityUi();
+    void openSettingsDialog();
 
     std::unique_ptr<AtemClient> m_client;
     QVector<AtemInputInfo> m_inputs;
@@ -50,5 +54,7 @@ private:
     QTableWidget *m_corrTable = nullptr;
     HistogramWidget *m_hist = nullptr;
     VectorscopeWidget *m_vectorscope = nullptr;
+    QLabel *m_configBanner = nullptr;
+    QPushButton *m_btnApply = nullptr;
     QHash<qint64, CameraCorrectionBundle> m_lastRollback;
 };
