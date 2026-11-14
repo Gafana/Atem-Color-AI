@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 env:
-  GSTREAMER_VERSION: "1.24.12"
+  GSTREAMER_VERSION: "1.24.13"
   GSTREAMER_ROOT: "C:/gstreamer/1.0/msvc_x86_64"
   QT_VERSION: "6.8.0"
 
