@@ -39,14 +39,29 @@ jobs:
       - name: Install NSIS
         run: choco install nsis -y --no-progress
 
-      - name: Install GStreamer (MSVC runtime + devel)
+      - name: Download GStreamer MSVC packages
+        shell: pwsh
         run: |
-          set -euo pipefail
-          BASE="https://gstreamer.freedesktop.org/data/pkg/windows/${GSTREAMER_VERSION}/msvc"
-          curl -fsSL -o gst-runtime.msi "${BASE}/gstreamer-1.0-msvc-x86_64-${GSTREAMER_VERSION}.msi"
-          curl -fsSL -o gst-devel.msi "${BASE}/gstreamer-1.0-devel-msvc-x86_64-${GSTREAMER_VERSION}.msi"
-          msiexec /i gst-runtime.msi /quiet /norestart ADDLOCAL=ALL
-          msiexec /i gst-devel.msi /quiet /norestart ADDLOCAL=ALL
+          $ErrorActionPreference = "Stop"
+          $ver = $env:GSTREAMER_VERSION
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$ver/msvc"
+          Invoke-WebRequest -Uri "$base/gstreamer-1.0-msvc-x86_64-$ver.msi" -OutFile gst-runtime.msi
+          Invoke-WebRequest -Uri "$base/gstreamer-1.0-devel-msvc-x86_64-$ver.msi" -OutFile gst-devel.msi
+
+      - name: Install GStreamer (MSVC runtime + devel)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($msi in @("gst-runtime.msi", "gst-devel.msi")) {
+            Write-Host "Installing $msi ..."
+            $p = Start-Process -FilePath msiexec.exe -ArgumentList "/i", $msi, "/qn", "/norestart" -Wait -PassThru
+            if ($p.ExitCode -notin 0, 3010) {
+              throw "msiexec $msi failed with exit $($p.ExitCode)"
+            }
+          }
+          if (-not (Test-Path "$env:GSTREAMER_ROOT/include/gstreamer-1.0")) {
+            throw "GSTREAMER_ROOT not found at $env:GSTREAMER_ROOT"
+          }
 
       - name: Optionally fetch ATEM SDK (build-time only)
         env:
