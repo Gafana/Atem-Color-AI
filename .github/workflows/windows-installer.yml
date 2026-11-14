@@ -116,7 +116,10 @@ jobs:
           set -euo pipefail
           CMAKE_ARGS=(
             -B build
-            -G "Visual Studio 17 2022" -A x64
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_C_COMPILER=cl
+            -DCMAKE_CXX_COMPILER=cl
             -DENABLE_GUI=ON
             -DENABLE_GSTREAMER=ON
             -DBUILD_TESTING=ON
@@ -134,13 +137,13 @@ jobs:
             CMAKE_ARGS+=("-DATEM_SDK_DIR=${ATEM_SDK_DIR}")
           fi
           cmake "${CMAKE_ARGS[@]}"
-          cmake --build build --config Release --parallel
-          ctest --test-dir build -C Release --output-on-failure
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
 
       - name: Create NSIS installer (CPack)
         run: |
           set -euo pipefail
-          cmake --build build --config Release --target package
+          cmake --build build --target package
           mkdir -p dist
           shopt -s nullglob
           installers=(build/AtemColorAI-*.exe)
