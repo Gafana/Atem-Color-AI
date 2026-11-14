@@ -135,9 +135,10 @@ int main(int argc, char *argv[])
 
     QCommandLineOption analyzeOption(
         QStringLiteral("analyze"),
-        QStringLiteral("Analyze PNGs: first file is reference, rest are candidates"),
-        QStringLiteral("png"));
+        QStringLiteral("Analyze PNGs (positional): first = reference, rest = candidates"));
     parser.addOption(analyzeOption);
+    parser.addPositionalArgument(QStringLiteral("png"),
+                                 QStringLiteral("PNG paths used with --analyze"));
 
     QCommandLineOption jsonOption(QStringLiteral("json"), QStringLiteral("JSON output for --analyze"));
     parser.addOption(jsonOption);
@@ -171,7 +172,7 @@ int main(int argc, char *argv[])
 #endif
 
     if (parser.isSet(analyzeOption)) {
-        const QStringList paths = parser.values(analyzeOption);
+        const QStringList paths = parser.positionalArguments();
         const float damping = parser.value(dampingOption).toFloat();
         return runAnalyzeCli(paths, parser.isSet(jsonOption), damping);
     }

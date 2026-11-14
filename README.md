@@ -48,6 +48,8 @@ ctest --test-dir build --output-on-failure
 ./build/atem-color-ai --analyze ref.png cam2.png --json
 ```
 
+Первый PNG — эталон, остальные — кандидаты (позиционные аргументы).
+
 GUI:
 
 ```bash
