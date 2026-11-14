@@ -1,4 +1,4 @@
-; Warn when Blackmagic ATEM Switchers runtime (COM) is missing — installer does not ship SDK or BMD software.
+; Warn when Blackmagic ATEM Switchers runtime (COM) is missing.
 
 !macro AtemRuntimeInstallWarning
   StrCpy $R0 "0"
@@ -21,10 +21,10 @@
   checkdone:
   StrCmp $R0 "1" done
   MessageBox MB_OK|MB_ICONEXCLAMATION \
-    "Blackmagic ATEM Switchers / ATEM Software Control не найден.$\r$\n$\r$\n\
-    Для подключения к пульту ATEM нужен COM-сервер BMDSwitcherAPI, который ставится вместе с ПО Blackmagic.$\r$\n\
-    Установите ATEM Software Control с сайта Blackmagic:$\r$\n\
+    "Blackmagic ATEM Switchers / ATEM Software Control was not found.$\r$\n$\r$\n\
+    Live ATEM control needs the BMDSwitcherAPI COM server installed by Blackmagic.$\r$\n\
+    Install ATEM Software Control from:$\r$\n\
     https://www.blackmagicdesign.com/support/family/atem-live-production-switchers$\r$\n$\r$\n\
-    Программа Atem Color AI установлена, но без Blackmagic ПО подключение к ATEM работать не будет."
+    Atem Color AI was installed, but ATEM connection will not work without Blackmagic software."
   done:
 !macroend

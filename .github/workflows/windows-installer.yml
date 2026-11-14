@@ -149,6 +149,9 @@ jobs:
           installers=(build/AtemColorAI-*.exe)
           if (( ${#installers[@]} == 0 )); then
             echo "No CPack installer produced" >&2
+            if [[ -f build/_CPack_Packages/win64/NSIS/NSISOutput.log ]]; then
+              cat build/_CPack_Packages/win64/NSIS/NSISOutput.log
+            fi
             exit 1
           fi
           cp -v "${installers[@]}" dist/
