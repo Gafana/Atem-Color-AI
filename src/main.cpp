@@ -1,6 +1,7 @@
 #include "atem/AtemClient.h"
 #include "color/ColorAnalysis.h"
 #include "color/ColorMatching.h"
+#include "platform/AtemRuntime.h"
 
 #include <QCommandLineParser>
 #include <QCoreApplication>
@@ -11,7 +12,12 @@
 
 #ifdef ENABLE_GUI
 #include <QApplication>
+#include <QMessageBox>
 #include "gui/MainWindow.h"
+#endif
+
+#ifdef _WIN32
+#include "platform/WindowsBundledPaths.h"
 #endif
 
 #ifdef HAVE_GSTREAMER
@@ -102,6 +108,10 @@ int main(int argc, char *argv[])
     QCoreApplication::setApplicationName(QStringLiteral("atem-color-ai"));
     QCoreApplication::setApplicationVersion(QStringLiteral("0.2.0"));
 
+#ifdef _WIN32
+    applyWindowsBundledRuntimePaths();
+#endif
+
     QCommandLineParser parser;
     parser.setApplicationDescription(
         QStringLiteral("ATEM camera color analysis / matching and optional GStreamer capture"));
@@ -157,8 +167,29 @@ int main(int argc, char *argv[])
 
     parser.process(app);
 
+    auto warnMissingAtemRuntime = [&]() -> bool {
+#ifdef HAVE_ATEM_SDK
+        if (AtemRuntime::isBlackmagicAtemRuntimeAvailable())
+            return true;
+        const QString text = AtemRuntime::missingRuntimeUserMessage();
+#ifdef ENABLE_GUI
+        if (parser.isSet(guiOption)) {
+            QMessageBox::warning(nullptr, QStringLiteral("ATEM Software Control не установлен"), text);
+            return false;
+        }
+#endif
+        qCCritical(lc).noquote() << text;
+        return false;
+#else
+        Q_UNUSED(parser);
+        return true;
+#endif
+    };
+
 #ifdef ENABLE_GUI
     if (parser.isSet(guiOption)) {
+        if (!warnMissingAtemRuntime())
+            return 4;
         auto client = createAtemClient();
         const QString ip = parser.value(ipOption);
         const QString connectError = client->connectTo(ip);
@@ -178,6 +209,8 @@ int main(int argc, char *argv[])
     }
 
     const QString ip = parser.value(ipOption);
+    if (!warnMissingAtemRuntime())
+        return 4;
     auto client = createAtemClient();
     qCInfo(lc) << "Backend:" << client->backendName();
     qCInfo(lc) << "Connecting to ATEM at" << ip << "...";

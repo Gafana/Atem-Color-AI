@@ -1,0 +1,183 @@
+name: Windows installer
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GSTREAMER_VERSION: "1.24.13"
+  QT_VERSION: "6.8.0"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          install-deps: "nosudo"
+
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+
+      - name: Download GStreamer MSVC packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = $env:GSTREAMER_VERSION
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$ver/msvc"
+          Invoke-WebRequest -Uri "$base/gstreamer-1.0-msvc-x86_64-$ver.msi" -OutFile gst-runtime.msi
+          Invoke-WebRequest -Uri "$base/gstreamer-1.0-devel-msvc-x86_64-$ver.msi" -OutFile gst-devel.msi
+
+      - name: Install GStreamer (MSVC runtime + devel)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($msi in @("gst-runtime.msi", "gst-devel.msi")) {
+            Write-Host "Installing $msi ..."
+            $p = Start-Process -FilePath msiexec.exe -ArgumentList @(
+              "/i", $msi, "INSTALLDIR=C:\gstreamer", "/qn", "/norestart"
+            ) -Wait -PassThru
+            if ($p.ExitCode -notin 0, 3010) {
+              throw "msiexec $msi failed with exit $($p.ExitCode)"
+            }
+          }
+          $candidates = @(
+            "C:\gstreamer\1.0\msvc_x86_64",
+            "C:\gstreamer\1.0\msvc_x86",
+            "C:\gstreamer",
+            "C:\Program Files\gstreamer\1.0\msvc_x86_64",
+            "C:\Program Files\gstreamer\1.0\x86_64"
+          )
+          $found = $null
+          foreach ($c in $candidates) {
+            if (Test-Path (Join-Path $c "include\gstreamer-1.0\gst\gst.h")) {
+              $found = $c
+              break
+            }
+          }
+          if (-not $found) {
+            $hit = Get-ChildItem -Path "C:\gstreamer","C:\Program Files" -Filter gst.h -Recurse -Depth 8 -ErrorAction SilentlyContinue `
+              | Where-Object { $_.FullName -match 'include\\gstreamer-1\.0\\gst\\gst\.h' } `
+              | Select-Object -First 1
+            if ($hit) {
+              $found = $hit.Directory.Parent.Parent.Parent.Parent.FullName
+            }
+          }
+          if (-not $found) {
+            Get-ChildItem -Path "C:\gstreamer","C:\Program Files\gstreamer" -ErrorAction SilentlyContinue -Recurse -Depth 4 | Select-Object -First 40
+            throw "Could not locate GStreamer prefix after MSI install"
+          }
+          $root = $found -replace '\\','/'
+          "GSTREAMER_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "GSTREAMER_ROOT=$root"
+
+      - name: Setup MSVC toolchain
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Optionally fetch ATEM SDK (build-time only)
+        env:
+          ATEM_SDK_URL: ${{ secrets.ATEM_SDK_URL }}
+        run: |
+          set -euo pipefail
+          echo "ATEM_SDK_VARIANT=mock" >> "$GITHUB_ENV"
+          if [[ -n "${ATEM_SDK_URL:-}" ]]; then
+            curl -fsSL -o atem-sdk.zip "${ATEM_SDK_URL}"
+            mkdir -p "${RUNNER_TEMP}/atem-sdk"
+            unzip -q atem-sdk.zip -d "${RUNNER_TEMP}/atem-sdk"
+            SDK_DIR="$(find "${RUNNER_TEMP}/atem-sdk" -maxdepth 3 -type d -iname '*ATEM*SDK*' | head -n1)"
+            if [[ -z "${SDK_DIR}" ]]; then
+              SDK_DIR="${RUNNER_TEMP}/atem-sdk"
+            fi
+            echo "ATEM_SDK_DIR=${SDK_DIR}" >> "$GITHUB_ENV"
+            echo "ATEM_SDK_VARIANT=atem-sdk" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure and build
+        run: |
+          set -euo pipefail
+          CMAKE_ARGS=(
+            -B build
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_C_COMPILER=cl
+            -DCMAKE_CXX_COMPILER=cl
+            -DENABLE_GUI=ON
+            -DENABLE_GSTREAMER=ON
+            -DBUILD_TESTING=ON
+            -DBUILD_WINDOWS_INSTALLER=ON
+            "-DCMAKE_INSTALL_PREFIX=${RUNNER_TEMP}/install"
+            "-DGSTREAMER_ROOT=${GSTREAMER_ROOT}"
+          )
+          if [[ -n "${CMAKE_PREFIX_PATH:-}" ]]; then
+            CMAKE_ARGS+=("-DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}")
+          fi
+          if [[ -n "${Qt6_DIR:-}" ]]; then
+            CMAKE_ARGS+=("-DQt6_DIR=${Qt6_DIR}")
+          fi
+          if [[ -n "${ATEM_SDK_DIR:-}" ]]; then
+            CMAKE_ARGS+=("-DATEM_SDK_DIR=${ATEM_SDK_DIR}")
+          fi
+          cmake "${CMAKE_ARGS[@]}"
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
+
+      - name: Create NSIS installer (CPack)
+        run: |
+          set -euo pipefail
+          cmake --build build --target package || {
+            if [[ -f build/_CPack_Packages/win64/NSIS/NSISOutput.log ]]; then
+              echo "---- NSISOutput.log ----"
+              cat build/_CPack_Packages/win64/NSIS/NSISOutput.log
+            fi
+            exit 1
+          }
+          mkdir -p dist
+          shopt -s nullglob
+          installers=(build/AtemColorAI-*.exe)
+          if (( ${#installers[@]} == 0 )); then
+            echo "No CPack installer produced" >&2
+            if [[ -f build/_CPack_Packages/win64/NSIS/NSISOutput.log ]]; then
+              cat build/_CPack_Packages/win64/NSIS/NSISOutput.log
+            fi
+            exit 1
+          fi
+          cp -v "${installers[@]}" dist/
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-${{ env.ATEM_SDK_VARIANT }}
+          path: |
+            dist/*.exe
+            build/AtemColorAI-*.exe
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/*.exe
+            build/AtemColorAI-*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
