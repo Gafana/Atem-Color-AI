@@ -43,6 +43,7 @@ private:
     void updatePlots();
     void rebuildAtemAvailabilityUi();
     void openSettingsDialog();
+    void openAdvancedSettingsDialog();
 
     std::unique_ptr<AtemClient> m_client;
     QVector<AtemInputInfo> m_inputs;

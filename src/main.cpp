@@ -213,13 +213,12 @@ int main(int argc, char *argv[])
         if (AtemAppSettings::isFirstRunPending()) {
             AtemPathsSetupDialog setup;
             setup.setSoftwareControlPath(AtemAppSettings::softwareControlPath());
-            setup.setSdkPath(AtemAppSettings::sdkPath());
             setup.applyAutoDetection();
             const int dlgResult = setup.exec();
             if (dlgResult == QDialog::Accepted) {
                 const QString control =
                     AtemPathValidation::normalizeSoftwareControlPath(setup.softwareControlPath());
-                AtemAppSettings::save(setup.sdkPath(), control, true);
+                AtemAppSettings::save(AtemAppSettings::sdkPath(), control, true);
             } else {
                 AtemAppSettings::markFirstRunCompleted();
             }

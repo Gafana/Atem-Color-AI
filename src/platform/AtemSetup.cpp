@@ -28,22 +28,15 @@ QString configurationBannerText()
     return {};
 #endif
     QStringList parts;
-    const QString sdk = AtemAppSettings::sdkPath();
     const QString control = AtemAppSettings::softwareControlPath();
-
-    const auto sdkCheck = AtemPathValidation::validateSdkPath(sdk);
     const auto controlCheck = AtemPathValidation::validateSoftwareControlPath(control);
 
     if (control.trimmed().isEmpty() || !controlCheck.valid) {
         parts << QStringLiteral(
             "Путь к ATEM Software Control не задан или неверен — подключение к пульту и "
             "«Применить поправки» недоступны. Анализ PNG и GStreamer работают. "
-            "Откройте «Настройки…» для указания папки установки Blackmagic ATEM Switchers.");
-    }
-    if (!sdk.trimmed().isEmpty() && !sdkCheck.valid) {
-        parts << QStringLiteral(
-            "Путь к ATEM SDK неверен (ожидаются BMDSwitcherAPI.h/.idl) — это влияет только "
-            "на диагностику; для работы с пультом нужен корректный путь к ATEM Software Control.");
+            "Откройте «Настройки → Пути ATEM…» для указания папки установки Blackmagic ATEM "
+            "Switchers.");
     }
 
 #ifdef _WIN32

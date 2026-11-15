@@ -158,6 +158,8 @@ if(ENABLE_GUI)
     list(APPEND APP_SOURCES
         src/gui/AtemPathsSetupDialog.h
         src/gui/AtemPathsSetupDialog.cpp
+        src/gui/AtemAdvancedSettingsDialog.h
+        src/gui/AtemAdvancedSettingsDialog.cpp
         src/gui/MainWindow.h
         src/gui/MainWindow.cpp
         src/gui/HistogramWidget.h

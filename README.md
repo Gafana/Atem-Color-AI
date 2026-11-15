@@ -104,26 +104,27 @@ GUI:
 
 ## Первый запуск и настройки
 
-При первом запуске **GUI** (пока в настройках не выставлен флаг `firstRunDone`) открывается диалог **«Настройка путей ATEM»**:
+При первом запуске **GUI** (пока в настройках не выставлен флаг `firstRunDone`) открывается диалог **«Настройка путей ATEM»** с одним полем:
 
 | Поле | Назначение |
 |------|------------|
-| **Путь к ATEM SDK** | Каталог с распакованным Blackmagic ATEM Switchers SDK (`BMDSwitcherAPI.h` / `.idl`, часто в подкаталоге `Win/`). Нужен в основном для **сборки** (MIDL) и **диагностики** в рантайме; в инсталлятор SDK не входит. |
 | **ATEM Software Control** | Папка установки Blackmagic ATEM Switchers или `ATEM Software Control.exe`. Через `BMDSwitcherAPI.dll` и зарегистрированный COM-сервер приложение подключается к пульту. |
 
-Кнопки **«Обзор…»**, **«Автоопределение»** (реестр / типовые пути `Program Files\Blackmagic Design\Blackmagic ATEM Switchers`, переменная `ATEM_SDK_DIR` при сборке), индикаторы валидности, **«Сохранить»** и **«Пропустить»**.
+Кнопки **«Обзор…»**, **«Автоопределение»** (реестр / типовые пути `Program Files\Blackmagic Design\Blackmagic ATEM Switchers`), индикаторы валидности (✓/✗), **«Сохранить»** и **«Пропустить»**.
 
-**Хранение:** файл INI в каталоге `QStandardPaths::AppConfigLocation` (Windows: `%AppData%\<org>\<app>\settings.ini`). Ключи: `atem/sdkPath`, `atem/softwareControlPath`, `atem/firstRunDone`.
+**Путь к ATEM SDK** в первом запуске не запрашивается: SDK нужен только при **сборке** (MIDL). Необязательную проверку каталога SDK для разработчиков можно задать в **«Настройки → Дополнительно…»** (на работу с пультом не влияет).
 
-Пути можно сменить в меню **«Настройки → Пути ATEM…»** или из CLI (значения записываются в тот же INI):
+**Хранение:** файл INI в каталоге `QStandardPaths::AppConfigLocation` (Windows: `%AppData%\<org>\<app>\settings.ini`). Ключи: `atem/sdkPath`, `atem/softwareControlPath`, `atem/firstRunDone` (старые `settings.ini` с `sdkPath` остаются совместимыми).
+
+Пути можно сменить в меню **«Настройки → Пути ATEM…»** / **«Дополнительно…»** или из CLI (значения записываются в тот же INI):
 
 ```bash
-./build/atem-color-ai --sdk-path "D:/SDK/Blackmagic ATEM Switchers SDK 11.0.1" \
-  --atem-control-path "C:/Program Files (x86)/Blackmagic Design/Blackmagic ATEM Switchers"
+./build/atem-color-ai --atem-control-path "C:/Program Files (x86)/Blackmagic Design/Blackmagic ATEM Switchers"
+./build/atem-color-ai --sdk-path "D:/SDK/Blackmagic ATEM Switchers SDK 11.0.1"
 ./build/atem-color-ai --reset-settings
 ```
 
-Если путь к **ATEM Software Control** не задан или неверен, приложение **не завершается**: в главном окне показывается предупреждение, **«Применить поправки»** отключена; анализ PNG и GStreamer доступны. В CLI выводится предупреждение в лог (`atem.setup`).
+Если путь к **ATEM Software Control** не задан или неверен, приложение **не завершается**: в главном окне показывается предупреждение, **«Применить поправки»** отключена; анализ PNG и GStreamer доступны. Неверный путь к SDK **не** блокирует UI. В CLI выводится предупреждение в лог (`atem.setup`).
 
 Захват кадра:
 
@@ -138,7 +139,7 @@ src/
   color/           — анализ и сведение
   atem/            — AtemClient, Camera Control, mock/SDK
   capture/         — GStreamer appsink
-  gui/             — AtemPathsSetupDialog, MainWindow (ENABLE_GUI)
+  gui/             — AtemPathsSetupDialog, AtemAdvancedSettingsDialog, MainWindow (ENABLE_GUI)
   platform/        — QSettings (пути ATEM), валидация, ATEM runtime, GStreamer (Windows)
   main.cpp         — CLI + GUI entry
 cmake/

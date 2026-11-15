@@ -19,6 +19,7 @@ private Q_SLOTS:
     void softwareControlValidationDll();
     void softwareControlValidationExe();
     void settingsRoundTrip();
+    void controlSavePreservesSdkPath();
 };
 
 void TestAtemPaths::initTestCase()
@@ -94,6 +95,29 @@ void TestAtemPaths::settingsRoundTrip()
     QVERIFY(QFile::exists(AtemAppSettings::settingsFilePath()));
     AtemAppSettings::reset();
     QVERIFY(!QFile::exists(AtemAppSettings::settingsFilePath()));
+}
+
+void TestAtemPaths::controlSavePreservesSdkPath()
+{
+    AtemAppSettings::reset();
+    AtemAppSettings::save(QStringLiteral("/sdk/kept"), QStringLiteral("/control/old"), true);
+
+    QString sdk;
+    QString control;
+    bool done = false;
+    AtemAppSettings::load(&sdk, &control, &done);
+    QCOMPARE(sdk, QStringLiteral("/sdk/kept"));
+    QCOMPARE(control, QStringLiteral("/control/old"));
+    QVERIFY(done);
+
+    // As in «Пути ATEM…» after first-run refactor: only Software Control is edited; sdkPath stays.
+    AtemAppSettings::save(sdk, QStringLiteral("/control/new"), true);
+    AtemAppSettings::load(&sdk, &control, &done);
+    QCOMPARE(sdk, QStringLiteral("/sdk/kept"));
+    QCOMPARE(control, QStringLiteral("/control/new"));
+
+    const auto sdkCheck = AtemPathValidation::validateSdkPath(sdk);
+    QVERIFY(!sdkCheck.valid);
 }
 
 QTEST_MAIN(TestAtemPaths)
