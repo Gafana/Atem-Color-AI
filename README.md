@@ -28,6 +28,7 @@
 | Среда выполнения **GStreamer** (DLL + плагины в `gstreamer/`, `GST_PLUGIN_PATH` настраивается при старте) | да |
 | Распространяемые библиотеки **MSVC** | да |
 | Файлы **Blackmagic ATEM SDK** или ATEM Software Control | **нет** |
+| Изменение системного **PATH** при установке | **нет** (запуск через ярлыки Пуск / рабочий стол) |
 
 Лицензия SDK: [docs/atem-sdk-license-notes.md](docs/atem-sdk-license-notes.md).
 
