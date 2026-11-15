@@ -422,7 +422,7 @@ private:
     {
         if (!input || !m_switcherSupportsCameraControl)
             return false;
-        bool supportsModel = false;
+        BOOL supportsModel = FALSE;
         if (SUCCEEDED(input->DoesSupportCameraModel(&supportsModel)) && supportsModel)
             return true;
         return false;
