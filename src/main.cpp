@@ -1,7 +1,10 @@
 #include "atem/AtemClient.h"
 #include "color/ColorAnalysis.h"
 #include "color/ColorMatching.h"
+#include "platform/AtemAppSettings.h"
+#include "platform/AtemPathValidation.h"
 #include "platform/AtemRuntime.h"
+#include "platform/AtemSetup.h"
 
 #include <QCommandLineParser>
 #include <QCoreApplication>
@@ -12,7 +15,9 @@
 
 #ifdef ENABLE_GUI
 #include <QApplication>
+#include <QDialog>
 #include <QMessageBox>
+#include "gui/AtemPathsSetupDialog.h"
 #include "gui/MainWindow.h"
 #endif
 
@@ -105,6 +110,7 @@ int main(int argc, char *argv[])
 #else
     QCoreApplication app(argc, argv);
 #endif
+    QCoreApplication::setOrganizationName(QStringLiteral("Gafana"));
     QCoreApplication::setApplicationName(QStringLiteral("atem-color-ai"));
     QCoreApplication::setApplicationVersion(QStringLiteral("0.2.0"));
 
@@ -160,6 +166,22 @@ int main(int argc, char *argv[])
         QStringLiteral("0.35"));
     parser.addOption(dampingOption);
 
+    QCommandLineOption sdkPathOption(
+        QStringLiteral("sdk-path"),
+        QStringLiteral("Path to Blackmagic ATEM SDK folder (saved to user settings)"),
+        QStringLiteral("dir"));
+    parser.addOption(sdkPathOption);
+
+    QCommandLineOption atemControlPathOption(
+        QStringLiteral("atem-control-path"),
+        QStringLiteral("Path to ATEM Software Control install folder or .exe (saved to settings)"),
+        QStringLiteral("path"));
+    parser.addOption(atemControlPathOption);
+
+    QCommandLineOption resetSettingsOption(
+        QStringLiteral("reset-settings"), QStringLiteral("Delete saved ATEM path settings"));
+    parser.addOption(resetSettingsOption);
+
 #ifdef ENABLE_GUI
     QCommandLineOption guiOption(QStringLiteral("gui"), QStringLiteral("Open Qt Widgets UI"));
     parser.addOption(guiOption);
@@ -167,29 +189,42 @@ int main(int argc, char *argv[])
 
     parser.process(app);
 
-    auto warnMissingAtemRuntime = [&]() -> bool {
+    AtemAppSettings::applyFromCommandLine(parser.value(sdkPathOption),
+                                          parser.value(atemControlPathOption),
+                                          parser.isSet(resetSettingsOption));
+
+    auto warnMissingAtemRuntime = [&]() {
 #ifdef HAVE_ATEM_SDK
         if (AtemRuntime::isBlackmagicAtemRuntimeAvailable())
-            return true;
+            return;
         const QString text = AtemRuntime::missingRuntimeUserMessage();
-#ifdef ENABLE_GUI
-        if (parser.isSet(guiOption)) {
-            QMessageBox::warning(nullptr, QStringLiteral("ATEM Software Control не установлен"), text);
-            return false;
-        }
-#endif
-        qCCritical(lc).noquote() << text;
-        return false;
+        qCWarning(lc).noquote() << text;
 #else
         Q_UNUSED(parser);
-        return true;
 #endif
     };
 
+    AtemSetup::logConfigurationWarnings();
+
 #ifdef ENABLE_GUI
     if (parser.isSet(guiOption)) {
-        if (!warnMissingAtemRuntime())
-            return 4;
+        warnMissingAtemRuntime();
+
+        if (AtemAppSettings::isFirstRunPending()) {
+            AtemPathsSetupDialog setup;
+            setup.setSoftwareControlPath(AtemAppSettings::softwareControlPath());
+            setup.setSdkPath(AtemAppSettings::sdkPath());
+            setup.applyAutoDetection();
+            const int dlgResult = setup.exec();
+            if (dlgResult == QDialog::Accepted) {
+                const QString control =
+                    AtemPathValidation::normalizeSoftwareControlPath(setup.softwareControlPath());
+                AtemAppSettings::save(setup.sdkPath(), control, true);
+            } else {
+                AtemAppSettings::markFirstRunCompleted();
+            }
+        }
+
         auto client = createAtemClient();
         const QString ip = parser.value(ipOption);
         const QString connectError = client->connectTo(ip);
@@ -209,8 +244,7 @@ int main(int argc, char *argv[])
     }
 
     const QString ip = parser.value(ipOption);
-    if (!warnMissingAtemRuntime())
-        return 4;
+    warnMissingAtemRuntime();
     auto client = createAtemClient();
     qCInfo(lc) << "Backend:" << client->backendName();
     qCInfo(lc) << "Connecting to ATEM at" << ip << "...";

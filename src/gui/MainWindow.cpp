@@ -1,14 +1,19 @@
 #include "MainWindow.h"
+#include "AtemPathsSetupDialog.h"
 #include "HistogramWidget.h"
 #include "VectorscopeWidget.h"
 
 #include "color/ColorAnalysis.h"
+#include "platform/AtemAppSettings.h"
+#include "platform/AtemPathValidation.h"
+#include "platform/AtemSetup.h"
 
 #ifdef HAVE_GSTREAMER
 #include "capture/GstFrameCapture.h"
 #endif
 
 #include <QComboBox>
+#include <QDialog>
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -16,6 +21,7 @@
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenuBar>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSplitter>
@@ -28,6 +34,9 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, QWidget *parent)
 {
     setWindowTitle(QStringLiteral("Atem Color AI"));
     resize(1100, 720);
+
+    auto *settingsMenu = menuBar()->addMenu(QStringLiteral("Настройки"));
+    settingsMenu->addAction(QStringLiteral("Пути ATEM…"), this, &MainWindow::openSettingsDialog);
 
     if (m_client && m_client->isConnected()) {
         m_inputs = m_client->listInputs();
@@ -44,6 +53,13 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, QWidget *parent)
 
     auto *central = new QWidget(this);
     auto *layout = new QVBoxLayout(central);
+
+    m_configBanner = new QLabel(central);
+    m_configBanner->setWordWrap(true);
+    m_configBanner->setStyleSheet(
+        QStringLiteral("QLabel { background: #fff8e6; border: 1px solid #e6c200; padding: 8px; }"));
+    m_configBanner->setVisible(false);
+    layout->addWidget(m_configBanner);
 
     auto *topRow = new QHBoxLayout();
     topRow->addWidget(new QLabel(QStringLiteral("Эталон:")));
@@ -86,10 +102,10 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, QWidget *parent)
 
     auto *buttons = new QHBoxLayout();
     auto *btnCapture = new QPushButton(QStringLiteral("Захватить / Анализировать"), central);
-    auto *btnApply = new QPushButton(QStringLiteral("Применить поправки"), central);
+    m_btnApply = new QPushButton(QStringLiteral("Применить поправки"), central);
     auto *btnRollback = new QPushButton(QStringLiteral("Откат"), central);
     connect(btnCapture, &QPushButton::clicked, this, &MainWindow::onCaptureAnalyze);
-    connect(btnApply, &QPushButton::clicked, this, &MainWindow::onApply);
+    connect(m_btnApply, &QPushButton::clicked, this, &MainWindow::onApply);
     connect(btnRollback, &QPushButton::clicked, this, [this]() {
         if (!m_client)
             return;
@@ -102,12 +118,49 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, QWidget *parent)
         QMessageBox::information(this, QString(), QStringLiteral("Откат выполнен"));
     });
     buttons->addWidget(btnCapture);
-    buttons->addWidget(btnApply);
+    buttons->addWidget(m_btnApply);
     buttons->addWidget(btnRollback);
     layout->addLayout(buttons);
 
     setCentralWidget(central);
     onReferenceChanged(0);
+    rebuildAtemAvailabilityUi();
+}
+
+void MainWindow::rebuildAtemAvailabilityUi()
+{
+    const QString banner = AtemSetup::configurationBannerText();
+    if (m_configBanner) {
+        m_configBanner->setText(banner);
+        m_configBanner->setVisible(!banner.isEmpty());
+    }
+
+    const bool atemOk = AtemSetup::isLiveAtemControlAvailable();
+    if (m_btnApply) {
+        m_btnApply->setEnabled(atemOk && m_client && m_client->isConnected());
+        if (!atemOk) {
+            m_btnApply->setToolTip(QStringLiteral(
+                "Укажите корректный путь к ATEM Software Control в «Настройки → Пути ATEM…»"));
+        } else if (!m_client || !m_client->isConnected()) {
+            m_btnApply->setToolTip(QStringLiteral("Нет подключения к ATEM"));
+        } else {
+            m_btnApply->setToolTip(QString());
+        }
+    }
+}
+
+void MainWindow::openSettingsDialog()
+{
+    AtemPathsSetupDialog dlg(this);
+    dlg.setSdkPath(AtemAppSettings::sdkPath());
+    dlg.setSoftwareControlPath(AtemAppSettings::softwareControlPath());
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    const QString control = AtemPathValidation::normalizeSoftwareControlPath(
+        dlg.softwareControlPath());
+    AtemAppSettings::save(dlg.sdkPath(), control, true);
+    rebuildAtemAvailabilityUi();
 }
 
 bool MainWindow::loadFrameForCamera(int index, QImage &image)
@@ -171,6 +224,11 @@ void MainWindow::onCaptureAnalyze()
 
 void MainWindow::onApply()
 {
+    if (!AtemSetup::isLiveAtemControlAvailable()) {
+        QMessageBox::warning(this, QString(),
+                             QStringLiteral("Настройте путь к ATEM Software Control"));
+        return;
+    }
     if (!m_client || !m_client->isConnected()) {
         QMessageBox::warning(this, QString(), QStringLiteral("Нет подключения к ATEM"));
         return;
