@@ -48,6 +48,19 @@ function(install_gstreamer_bundle _gst_root)
         return()
     endif()
 
+    if(NOT EXISTS "${_gst_bin}")
+        message(WARNING "GStreamer bin dir missing: ${_gst_bin}")
+        return()
+    endif()
+
+    # Runtime DLLs must live next to atem-color-ai.exe (Windows loads them at process start).
+    file(GLOB _gst_bin_dlls "${_gst_bin}/*.dll")
+    if(_gst_bin_dlls)
+        install(FILES ${_gst_bin_dlls} DESTINATION bin)
+    else()
+        message(WARNING "No GStreamer DLLs found in ${_gst_bin}")
+    endif()
+
     set(_bundle_plugins
         gstcoreelements.dll gstvideoconvert.dll gstvideotestsrc.dll gstapp.dll
         gstpng.dll gstsrt.dll gsttypefindfunctions.dll gstplayback.dll
@@ -56,33 +69,32 @@ function(install_gstreamer_bundle _gst_root)
     )
     foreach(_plug IN LISTS _bundle_plugins)
         if(EXISTS "${_gst_plugins}/${_plug}")
-            install(FILES "${_gst_plugins}/${_plug}"
-                    DESTINATION gstreamer/lib/gstreamer-1.0)
+            install(FILES "${_gst_plugins}/${_plug}" DESTINATION lib/gstreamer-1.0)
         endif()
     endforeach()
 
-    file(GLOB _gst_core_dlls
-        "${_gst_bin}/gst*.dll"
-        "${_gst_bin}/libg*.dll"
-        "${_gst_bin}/libgcc*.dll"
-        "${_gst_bin}/libwinpthread*.dll"
-    )
-
     if(EXISTS "${_gst_libexec}")
         install(DIRECTORY "${_gst_libexec}/"
-                DESTINATION gstreamer/libexec/gstreamer-1.0
+                DESTINATION libexec/gstreamer-1.0
                 FILES_MATCHING
                 PATTERN "gst-plugin-scanner.exe")
     endif()
+endfunction()
 
-    file(GLOB _gst_bin_extra
-        "${_gst_bin}/zlib*.dll"
-        "${_gst_bin}/iconv*.dll"
-        "${_gst_bin}/intl*.dll"
-        "${_gst_bin}/orc*.dll"
-        "${_gst_bin}/srtp*.dll"
-        "${_gst_bin}/libsrt*.dll"
-    )
-    install(FILES ${_gst_bin_extra} DESTINATION gstreamer/bin OPTIONAL)
-    install(FILES ${_gst_core_dlls} DESTINATION gstreamer/bin OPTIONAL)
+# NSIS Start Menu + desktop shortcuts (must match install(TARGETS …) executable name).
+function(atem_configure_cpack_nsis_shortcuts)
+    set(_exe "atem-color-ai")
+    set(_label "Atem Color AI")
+
+    set(CPACK_PACKAGE_EXECUTABLES "${_exe};${_label}" PARENT_SCOPE)
+    set(CPACK_CREATE_DESKTOP_LINKS "${_exe}" PARENT_SCOPE)
+    set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\\\${_exe}.exe" PARENT_SCOPE)
+
+    # CPACK_CREATE_DESKTOP_LINKS relies on the install-options page tied to PATH; with
+    # CPACK_NSIS_MODIFY_PATH OFF the checkbox does not create icons (CMake #15982).
+    # Forward slashes in INSTDIR paths — valid for NSIS and avoid CMake escape errors in CPackConfig.
+    set(_desktop_shortcut
+        "CreateShortCut \"\$DESKTOP/${_label}.lnk\" \"\$INSTDIR/bin/${_exe}.exe\"")
+    set(CPACK_NSIS_CREATE_ICONS_EXTRA "${_desktop_shortcut}" PARENT_SCOPE)
+    set(CPACK_NSIS_DELETE_ICONS_EXTRA "Delete \"\$DESKTOP/${_label}.lnk\"" PARENT_SCOPE)
 endfunction()

@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "AtemAdvancedSettingsDialog.h"
 #include "AtemPathsSetupDialog.h"
 #include "HistogramWidget.h"
 #include "VectorscopeWidget.h"
@@ -37,6 +38,8 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, QWidget *parent)
 
     auto *settingsMenu = menuBar()->addMenu(QStringLiteral("Настройки"));
     settingsMenu->addAction(QStringLiteral("Пути ATEM…"), this, &MainWindow::openSettingsDialog);
+    settingsMenu->addAction(QStringLiteral("Дополнительно…"), this,
+                            &MainWindow::openAdvancedSettingsDialog);
 
     if (m_client && m_client->isConnected()) {
         m_inputs = m_client->listInputs();
@@ -152,15 +155,24 @@ void MainWindow::rebuildAtemAvailabilityUi()
 void MainWindow::openSettingsDialog()
 {
     AtemPathsSetupDialog dlg(this);
-    dlg.setSdkPath(AtemAppSettings::sdkPath());
     dlg.setSoftwareControlPath(AtemAppSettings::softwareControlPath());
     if (dlg.exec() != QDialog::Accepted)
         return;
 
     const QString control = AtemPathValidation::normalizeSoftwareControlPath(
         dlg.softwareControlPath());
-    AtemAppSettings::save(dlg.sdkPath(), control, true);
+    AtemAppSettings::save(AtemAppSettings::sdkPath(), control, true);
     rebuildAtemAvailabilityUi();
+}
+
+void MainWindow::openAdvancedSettingsDialog()
+{
+    AtemAdvancedSettingsDialog dlg(this);
+    dlg.setSdkPath(AtemAppSettings::sdkPath());
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    AtemAppSettings::save(dlg.sdkPath(), AtemAppSettings::softwareControlPath(), true);
 }
 
 bool MainWindow::loadFrameForCamera(int index, QImage &image)

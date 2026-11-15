@@ -158,6 +158,8 @@ if(ENABLE_GUI)
     list(APPEND APP_SOURCES
         src/gui/AtemPathsSetupDialog.h
         src/gui/AtemPathsSetupDialog.cpp
+        src/gui/AtemAdvancedSettingsDialog.h
+        src/gui/AtemAdvancedSettingsDialog.cpp
         src/gui/MainWindow.h
         src/gui/MainWindow.cpp
         src/gui/HistogramWidget.h
@@ -229,7 +231,9 @@ if(WIN32 AND BUILD_WINDOWS_INSTALLER)
         "https://www.blackmagicdesign.com/support/family/atem-live-production-switchers")
     set(CPACK_NSIS_URL_INFO_ABOUT "https://github.com/Gafana/Atem-Color-AI")
     set(CPACK_NSIS_CONTACT "https://github.com/Gafana/Atem-Color-AI")
-    set(CPACK_NSIS_MODIFY_PATH ON)
+    atem_configure_cpack_nsis_shortcuts()
+    # Do not append install dir to system PATH (long PATH breaks NSIS; app uses bundled layout).
+    set(CPACK_NSIS_MODIFY_PATH OFF)
     set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
     set(CPACK_PACKAGE_FILE_NAME
         "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-win64-${ATEM_BUILD_VARIANT}")
@@ -241,6 +245,7 @@ if(WIN32 AND BUILD_WINDOWS_INSTALLER)
         set(CPACK_INSTALL_CONFIG_NAME Release)
     endif()
 
+    set(CPACK_VERBATIM_VARIABLES TRUE)
     include(CPack)
 endif()
 
