@@ -245,6 +245,7 @@ if(WIN32 AND BUILD_WINDOWS_INSTALLER)
         set(CPACK_INSTALL_CONFIG_NAME Release)
     endif()
 
+    set(CPACK_VERBATIM_VARIABLES TRUE)
     include(CPack)
 endif()
 

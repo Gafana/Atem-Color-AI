@@ -92,10 +92,9 @@ function(atem_configure_cpack_nsis_shortcuts)
 
     # CPACK_CREATE_DESKTOP_LINKS relies on the install-options page tied to PATH; with
     # CPACK_NSIS_MODIFY_PATH OFF the checkbox does not create icons (CMake #15982).
-    set(CPACK_NSIS_CREATE_ICONS_EXTRA
-        "CreateShortCut \"\$DESKTOP\\${_label}.lnk\" \"\$INSTDIR\\bin\\${_exe}.exe\""
-        PARENT_SCOPE)
-    set(CPACK_NSIS_DELETE_ICONS_EXTRA
-        "Delete \"\$DESKTOP\\${_label}.lnk\""
-        PARENT_SCOPE)
+    # Forward slashes in INSTDIR paths — valid for NSIS and avoid CMake escape errors in CPackConfig.
+    set(_desktop_shortcut
+        "CreateShortCut \"\$DESKTOP/${_label}.lnk\" \"\$INSTDIR/bin/${_exe}.exe\"")
+    set(CPACK_NSIS_CREATE_ICONS_EXTRA "${_desktop_shortcut}" PARENT_SCOPE)
+    set(CPACK_NSIS_DELETE_ICONS_EXTRA "Delete \"\$DESKTOP/${_label}.lnk\"" PARENT_SCOPE)
 endfunction()
