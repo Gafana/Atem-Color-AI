@@ -25,7 +25,7 @@
 |-----------|----------|
 | `atem-color-ai.exe` (GUI + CLI) | да |
 | Qt DLL и платформенные плагины (`windeployqt`) | да |
-| Среда выполнения **GStreamer** (DLL + плагины в `gstreamer/`, `GST_PLUGIN_PATH` настраивается при старте) | да |
+| Среда выполнения **GStreamer** (DLL GLib/GStreamer в `bin/` рядом с exe; плагины в `lib/gstreamer-1.0/`; `GST_PLUGIN_PATH` / scanner — при старте) | да |
 | Распространяемые библиотеки **MSVC** | да |
 | Файлы **Blackmagic ATEM SDK** или ATEM Software Control | **нет** |
 | Изменение системного **PATH** при установке | **нет** (запуск через ярлыки Пуск / рабочий стол) |

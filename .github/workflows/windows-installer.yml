@@ -192,6 +192,54 @@ jobs:
           fi
           cp -v "${installers[@]}" dist/
 
+      - name: Verify NSIS shortcut targets
+        run: |
+          set -euo pipefail
+          nsi="build/_CPack_Packages/win64/NSIS/project.nsi"
+          if [[ ! -f "$nsi" ]]; then
+            echo "Missing $nsi" >&2
+            exit 1
+          fi
+          grep -Fq 'atem-color-ai.exe' "$nsi"
+          grep -Fq 'SMPROGRAMS' "$nsi"
+          grep -Fq '$DESKTOP' "$nsi"
+          grep -Fq 'Atem Color AI.lnk' "$nsi"
+
+      - name: Smoke test installer (bundled GStreamer, no GStreamer on PATH)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = (Get-ChildItem -Path dist -Filter 'AtemColorAI-*.exe' | Select-Object -First 1).FullName
+          if (-not $installer) { throw 'Installer not found in dist/' }
+          $installDir = Join-Path $env:RUNNER_TEMP 'atem-smoke-install'
+          if (Test-Path $installDir) { Remove-Item -LiteralPath $installDir -Recurse -Force }
+          New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+          $proc = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "Silent install failed with exit $($proc.ExitCode)"
+          }
+          $exeDir = Join-Path $installDir 'bin'
+          $exe = Join-Path $exeDir 'atem-color-ai.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Installed binary missing: $exe"
+          }
+          foreach ($dll in @('gstreamer-1.0-0.dll', 'gstapp-1.0-0.dll', 'glib-2.0-0.dll', 'gobject-2.0-0.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $exeDir $dll))) {
+              throw "Missing bundled DLL in bin/: $dll"
+            }
+          }
+          $pluginsDir = Join-Path $installDir 'lib\gstreamer-1.0'
+          if (-not (Test-Path -LiteralPath $pluginsDir)) {
+            throw "Missing plugins dir: $pluginsDir"
+          }
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          Remove-Item env:GSTREAMER_ROOT -ErrorAction SilentlyContinue
+          Remove-Item env:GST_PLUGIN_PATH -ErrorAction SilentlyContinue
+          $run = Start-Process -FilePath $exe -ArgumentList @('--help') -Wait -PassThru -NoNewWindow
+          if ($run.ExitCode -ne 0) {
+            throw "atem-color-ai --help failed with exit $($run.ExitCode)"
+          }
+
       - name: Upload CI artifact
         uses: actions/upload-artifact@v4
         with:

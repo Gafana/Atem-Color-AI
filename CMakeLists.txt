@@ -231,6 +231,7 @@ if(WIN32 AND BUILD_WINDOWS_INSTALLER)
         "https://www.blackmagicdesign.com/support/family/atem-live-production-switchers")
     set(CPACK_NSIS_URL_INFO_ABOUT "https://github.com/Gafana/Atem-Color-AI")
     set(CPACK_NSIS_CONTACT "https://github.com/Gafana/Atem-Color-AI")
+    atem_configure_cpack_nsis_shortcuts()
     # Do not append install dir to system PATH (long PATH breaks NSIS; app uses bundled layout).
     set(CPACK_NSIS_MODIFY_PATH OFF)
     set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
