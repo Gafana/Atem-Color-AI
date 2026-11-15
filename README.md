@@ -15,7 +15,7 @@
 
 ## Установка (Windows, GitHub Release)
 
-1. Скачайте **`.exe`-инсталлятор** из [Releases](https://github.com/Gafana/Atem-Color-AI/releases) (имя содержит `win64-mock` или `win64-atem-sdk` — вариант сборки, не содержимое инсталлятора).
+1. Скачайте **`.exe`-инсталлятор** из [Releases](https://github.com/Gafana/Atem-Color-AI/releases) (имя `…-win64-atem-sdk.exe`; SDK в установщик **не** входит, только код, собранный с `HAVE_ATEM_SDK`).
 2. **Обязательно** установите [Blackmagic ATEM Switchers / ATEM Software Control](https://www.blackmagicdesign.com/support/family/atem-live-production-switchers) — без него COM-сервер `BMDSwitcherAPI` недоступен, и приложение не сможет подключиться к пульту (при установке нашего инсталлятора показывается предупреждение, если Blackmagic ПО не найдено).
 3. Запустите **Atem Color AI** из меню Пуск.
 
@@ -68,17 +68,18 @@ cmake --build build --config Release
 cmake --build build --config Release --target package
 ```
 
-Инсталлятор: `build\AtemColorAI-<version>-win64-mock.exe` или `...-atem-sdk.exe`.
+Инсталлятор (при заданном `ATEM_SDK_DIR`): `build\AtemColorAI-<version>-win64-atem-sdk.exe`. Без SDK локально собирается **mock** (`…-win64-mock.exe`) — только для разработки, не публикуется.
 
 ## CI и секрет `ATEM_SDK_URL`
 
-Workflow [`.github/workflows/windows-installer.yml`](.github/workflows/windows-installer.yml):
+Workflow [`.github/workflows/windows-installer.yml`](.github/workflows/windows-installer.yml) — одна job **`win64-atem-sdk`** (без matrix):
 
 - `pull_request` → сборка + артефакт инсталлятора;
 - тег `v*` → pre-release с инсталлятором;
-- `workflow_dispatch`.
+- `workflow_dispatch`;
+- smoke-тест: тихая установка и `atem-color-ai --help` без GStreamer в PATH.
 
-Если в настройках репозитория задан секрет **`ATEM_SDK_URL`** (приватная ссылка на zip SDK), CI скачивает SDK, запускает `midl` по `BMDSwitcherAPI.idl` и собирает с `HAVE_ATEM_SDK`. Файлы SDK **не** попадают в инсталлятор. Без секрета — сборка **mock**, суффикс `win64-mock` в имени файла.
+Секрет **`ATEM_SDK_URL`** (приватная ссылка на zip SDK) **обязателен** в CI: скачивание SDK, `midl` по `BMDSwitcherAPI.idl`, сборка с `HAVE_ATEM_SDK`. Файлы SDK **не** попадают в инсталлятор. Кэшируются Qt и префикс GStreamer MSVC.
 
 ## Запуск
 
