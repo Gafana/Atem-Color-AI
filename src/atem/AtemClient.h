@@ -2,6 +2,8 @@
 
 #include "CameraCorrection.h"
 
+struct CorrectionParameterMask;
+
 #include <QString>
 #include <QStringList>
 #include <QVector>
@@ -14,6 +16,12 @@ struct AtemInputInfo
     QString longName;
     QString portType; // HDMI, SDI, etc.
     bool cameraControlSupported = false;
+};
+
+struct AtemAuxOutput
+{
+    qint64 id = 0;
+    QString name;
 };
 
 class AtemClient
@@ -37,6 +45,17 @@ public:
     /** Enumerate switcher inputs (cameras / sources). */
     virtual QVector<AtemInputInfo> listInputs() = 0;
 
+    /** Aux / output ports that can be routed to a capture card. */
+    virtual QVector<AtemAuxOutput> listAuxOutputs() = 0;
+
+    /** Read or set the source routed to an aux output. Empty string on success. */
+    virtual QString auxSource(qint64 auxId, qint64 *sourceId) = 0;
+    virtual QString setAuxSource(qint64 auxId, qint64 sourceId) = 0;
+
+    /** Program bus of the first mix-effect block. */
+    virtual QString programInput(qint64 *inputId) = 0;
+    virtual QString setProgramInput(qint64 inputId) = 0;
+
     /**
      * Read current correction-related camera parameters when supported.
      * @return empty on success.
@@ -49,7 +68,9 @@ public:
      */
     virtual QString applyCorrectionBundle(qint64 destinationId,
                                           const CameraCorrectionBundle &bundle,
-                                          CameraCorrectionBundle *previousOut = nullptr) = 0;
+                                          CameraCorrectionBundle *previousOut = nullptr,
+                                          const CorrectionParameterMask *mask = nullptr,
+                                          const QString &tuningMode = QString()) = 0;
 
     /** Restore bundle previously read into @p previous. */
     virtual QString rollbackCorrection(qint64 destinationId, const CameraCorrectionBundle &previous) = 0;
@@ -67,6 +88,9 @@ public:
                                        int value1) = 0;
 
     virtual QString setCameraGainDb(qint64 destinationId, int gainDb) = 0;
+
+    /** Trigger a "void" camera command, e.g. auto white balance (1.3) or auto aperture (0.5). */
+    virtual QString triggerCameraAction(qint64 destinationId, uint8_t category, uint8_t parameter) = 0;
 };
 
 std::unique_ptr<AtemClient> createAtemClient();

@@ -15,6 +15,7 @@
 
 #ifdef ENABLE_GUI
 #include <QApplication>
+#include <QIcon>
 #include <QDialog>
 #include <QMessageBox>
 #include "gui/AtemPathsSetupDialog.h"
@@ -23,6 +24,10 @@
 
 #ifdef _WIN32
 #include "platform/WindowsBundledPaths.h"
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 #ifdef HAVE_GSTREAMER
@@ -103,8 +108,31 @@ static int runAnalyzeCli(const QStringList &paths, bool jsonOutput, float dampin
     return 0;
 }
 
+static QString resolveAtemIp(const QCommandLineParser &parser, const QCommandLineOption &atemIpOption,
+                             const QCommandLineOption &ipOption)
+{
+    if (parser.isSet(atemIpOption))
+        return parser.value(atemIpOption).trimmed();
+    if (parser.isSet(ipOption))
+        return parser.value(ipOption).trimmed();
+    return AtemAppSettings::ip().trimmed();
+}
+
 int main(int argc, char *argv[])
 {
+#ifdef _WIN32
+    // Qt writes log text as UTF-8; make the console show Cyrillic instead of mojibake.
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    // Double-click from Explorer: no arguments and the console belongs to this process only →
+    // drop the empty console window (CLI use from cmd/PowerShell keeps its console).
+    if (argc <= 1) {
+        DWORD consoleProcesses[4] = {};
+        if (GetConsoleProcessList(consoleProcesses, 4) <= 1)
+            FreeConsole();
+    }
+#endif
+    const bool launchedWithoutArguments = argc <= 1;
 #ifdef ENABLE_GUI
     QApplication app(argc, argv);
 #else
@@ -113,6 +141,15 @@ int main(int argc, char *argv[])
     QCoreApplication::setOrganizationName(QStringLiteral("Gafana"));
     QCoreApplication::setApplicationName(QStringLiteral("atem-color-ai"));
     QCoreApplication::setApplicationVersion(QStringLiteral("0.2.0"));
+#ifdef ENABLE_GUI
+    {
+        QIcon appIcon;
+        for (int size : {16, 32, 48, 64, 128, 256})
+            appIcon.addFile(QStringLiteral(":/icons/app-icon-%1.png").arg(size), QSize(size, size));
+        appIcon.addFile(QStringLiteral(":/icons/app-icon.png"), QSize(512, 512));
+        QApplication::setWindowIcon(appIcon);
+    }
+#endif
 
 #ifdef _WIN32
     applyWindowsBundledRuntimePaths();
@@ -124,11 +161,16 @@ int main(int argc, char *argv[])
     parser.addHelpOption();
     parser.addVersionOption();
 
+    QCommandLineOption atemIpOption(
+        QStringLiteral("atem-ip"),
+        QStringLiteral("ATEM switcher IP. Overrides settings.ini key atem/ip for this run."),
+        QStringLiteral("address"));
+    parser.addOption(atemIpOption);
+
     QCommandLineOption ipOption(
         QStringList{QStringLiteral("i"), QStringLiteral("ip")},
-        QStringLiteral("ATEM switcher IP address (default: 192.168.10.240)"),
-        QStringLiteral("address"),
-        QStringLiteral("192.168.10.240"));
+        QStringLiteral("Same as --atem-ip (overrides settings key atem/ip)."),
+        QStringLiteral("address"));
     parser.addOption(ipOption);
 
     QCommandLineOption listOnlyOption(
@@ -207,7 +249,8 @@ int main(int argc, char *argv[])
     AtemSetup::logConfigurationWarnings();
 
 #ifdef ENABLE_GUI
-    if (parser.isSet(guiOption)) {
+    // GUI is the default when started without arguments (double-click / desktop shortcut).
+    if (parser.isSet(guiOption) || launchedWithoutArguments) {
         warnMissingAtemRuntime();
 
         if (AtemAppSettings::isFirstRunPending()) {
@@ -225,12 +268,8 @@ int main(int argc, char *argv[])
         }
 
         auto client = createAtemClient();
-        const QString ip = parser.value(ipOption);
-        const QString connectError = client->connectTo(ip);
-        if (!connectError.isEmpty())
-            qCWarning(lc) << "ATEM connect failed (UI still opens):" << connectError;
-
-        MainWindow window(std::move(client));
+        const QString ip = resolveAtemIp(parser, atemIpOption, ipOption);
+        MainWindow window(std::move(client), ip);
         window.show();
         return app.exec();
     }
@@ -242,7 +281,11 @@ int main(int argc, char *argv[])
         return runAnalyzeCli(paths, parser.isSet(jsonOption), damping);
     }
 
-    const QString ip = parser.value(ipOption);
+    const QString ip = resolveAtemIp(parser, atemIpOption, ipOption);
+    if (ip.isEmpty()) {
+        qCCritical(lc) << "ATEM IP is not set. Pass --atem-ip <address> or save atem/ip in settings.ini.";
+        return 1;
+    }
     warnMissingAtemRuntime();
     auto client = createAtemClient();
     qCInfo(lc) << "Backend:" << client->backendName();

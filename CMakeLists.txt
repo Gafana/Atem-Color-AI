@@ -4,6 +4,7 @@ project(AtemColorAI VERSION 0.2.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -104,13 +105,39 @@ add_library(atem_color STATIC
     src/color/ColorTypes.h
     src/color/ColorAnalysis.h
     src/color/ColorAnalysis.cpp
+    src/color/ColorMatchMode.h
+    src/color/CorrectionParameterMask.h
+    src/color/CorrectionParameterMask.cpp
+    src/color/ColorCheckerData.h
+    src/color/ColorCheckerData.cpp
+    src/color/ColorTuning.h
+    src/color/ColorTuning.cpp
+    src/color/ReferenceFrameStore.h
+    src/color/ReferenceFrameStore.cpp
     src/color/ColorMatching.h
     src/color/ColorMatching.cpp
+    src/color/ColorScience.h
+    src/color/ColorScience.cpp
+    src/color/ColorCharts.h
+    src/color/ColorCharts.cpp
+    src/color/MatchEngine.h
+    src/color/MatchEngine.cpp
     src/atem/CameraControlProtocol.h
     src/atem/CameraCorrection.h
     src/atem/CameraCorrection.cpp
     src/atem/AtemCorrectionApply.h
     src/atem/AtemCorrectionApply.cpp
+    src/scopes/ScopeTypes.h
+    src/scopes/ScopeTypes.cpp
+    src/scopes/ScopeMath.h
+    src/scopes/ScopeMath.cpp
+    src/scopes/ScopeRender.h
+    src/scopes/ScopeWaveform.cpp
+    src/scopes/ScopeExtra.cpp
+    src/scopes/ScopeProcessor.h
+    src/scopes/ScopeProcessor.cpp
+    src/scopes/ScopeQc.h
+    src/scopes/ScopeQc.cpp
 )
 
 target_link_libraries(atem_color PUBLIC ${QT_LIBS})
@@ -130,6 +157,10 @@ set(APP_SOURCES
     src/platform/AtemRuntime.cpp
     src/platform/AtemSetup.h
     src/platform/AtemSetup.cpp
+    src/capture/MultiviewGeometry.h
+    src/capture/MultiviewGeometry.cpp
+    src/capture/CaptureRoute.h
+    src/capture/VideoDevice.h
 )
 
 if(WIN32)
@@ -151,6 +182,10 @@ if(HAVE_GSTREAMER)
     list(APPEND APP_SOURCES
         src/capture/GstFrameCapture.h
         src/capture/GstFrameCapture.cpp
+        src/capture/GstDeviceEnumerator.h
+        src/capture/GstDeviceEnumerator.cpp
+        src/capture/GstLivePreview.h
+        src/capture/GstLivePreview.cpp
     )
 endif()
 
@@ -166,7 +201,29 @@ if(ENABLE_GUI)
         src/gui/HistogramWidget.cpp
         src/gui/VectorscopeWidget.h
         src/gui/VectorscopeWidget.cpp
+        src/gui/scopes/ScopeComputeWorker.h
+        src/gui/scopes/ScopeComputeWorker.cpp
+        src/gui/scopes/ScopeCellView.h
+        src/gui/scopes/ScopeCellView.cpp
+        src/gui/scopes/ScopeSettingsDialog.h
+        src/gui/scopes/ScopeSettingsDialog.cpp
+        src/gui/docks/ScopeDockManager.h
+        src/gui/docks/ScopeDockManager.cpp
+        src/gui/docks/ScopeInstrumentWidget.h
+        src/gui/docks/ScopeInstrumentWidget.cpp
+        src/gui/docks/SnapshotManager.h
+        src/gui/docks/SnapshotManager.cpp
+        src/gui/PreviewOverlayWidget.h
+        src/gui/PreviewOverlayWidget.cpp
+        src/platform/CameraPresetStore.h
+        src/platform/CameraPresetStore.cpp
     )
+endif()
+
+# Application logo: Qt resource (window icon, dialogs) + Windows exe icon (Explorer, taskbar, shortcuts).
+list(APPEND APP_SOURCES resources/app.qrc)
+if(WIN32)
+    list(APPEND APP_SOURCES resources/app.rc)
 endif()
 
 add_executable(atem-color-ai ${APP_SOURCES})
@@ -195,6 +252,9 @@ endif()
 if(HAVE_GSTREAMER)
     target_compile_definitions(atem-color-ai PRIVATE HAVE_GSTREAMER)
     target_include_directories(atem-color-ai PRIVATE ${GSTREAMER_INCLUDE_DIRS})
+    if(GSTREAMER_LIBRARY_DIRS)
+        target_link_directories(atem-color-ai PRIVATE ${GSTREAMER_LIBRARY_DIRS})
+    endif()
     target_link_libraries(atem-color-ai PRIVATE ${GSTREAMER_LIBRARIES})
     target_compile_options(atem-color-ai PRIVATE ${GSTREAMER_CFLAGS_OTHER})
 endif()
@@ -218,6 +278,43 @@ if(WIN32 AND BUILD_WINDOWS_INSTALLER)
         "${CMAKE_SOURCE_DIR}/cmake/nsis/AtemRuntimeWarning.nsh"
         DESTINATION share/nsis)
 
+    # Clean systems: the MSVC runtime DLLs are installed app-local into bin/ (above); in addition the
+    # official VC++ 2015-2022 x64 redistributable is bundled and run silently (covers the GStreamer
+    # plugin scanner in libexec/ and anything loaded outside bin/).
+    set(_vcredist "")
+    file(TO_CMAKE_PATH "$ENV{VCToolsRedistDir}" _vc_redist_dir)
+    if(_vc_redist_dir AND EXISTS "${_vc_redist_dir}/vc_redist.x64.exe")
+        set(_vcredist "${_vc_redist_dir}/vc_redist.x64.exe")
+        string(REPLACE "//" "/" _vcredist "${_vcredist}")
+    else()
+        file(GLOB _vcredist_candidates
+            "$ENV{ProgramFiles}/Microsoft Visual Studio/*/*/VC/Redist/MSVC/*/vc_redist.x64.exe")
+        if(_vcredist_candidates)
+            list(GET _vcredist_candidates 0 _vcredist)
+        endif()
+    endif()
+    if(_vcredist)
+        message(STATUS "Bundling VC++ redistributable: ${_vcredist}")
+        install(PROGRAMS "${_vcredist}" DESTINATION redist)
+        set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS "
+  DetailPrint \"Installing Microsoft Visual C++ 2015-2022 x64 runtime...\"
+  ExecWait '\"$INSTDIR\\redist\\vc_redist.x64.exe\" /install /quiet /norestart' $0
+  DetailPrint \"VC++ runtime installer exit code: $0\"")
+    else()
+        message(WARNING "vc_redist.x64.exe not found — installer relies on app-local CRT DLLs only")
+    endif()
+
+    # ATEM Software Control (Blackmagic, not redistributable): the app needs its COM server
+    # (CBMDSwitcherDiscovery). Warn after installation when it is not registered.
+    string(APPEND CPACK_NSIS_EXTRA_INSTALL_COMMANDS "
+  SetRegView 64
+  ReadRegStr $1 HKLM \"SOFTWARE\\Classes\\CLSID\\{A9CDC765-3787-409D-A1E5-29F4F034A599}\\InprocServer32\" \"\"
+  SetRegView 32
+  StrCmp $1 \"\" 0 atem_runtime_ok
+    MessageBox MB_YESNO|MB_ICONEXCLAMATION \"Blackmagic ATEM Software Control is not installed (BMDSwitcherAPI COM server not found).$\\r$\\n$\\r$\\nAtem Color AI needs it to talk to the ATEM switcher. It cannot be bundled (Blackmagic license).$\\r$\\n$\\r$\\nOpen the Blackmagic download page now?\" /SD IDNO IDNO atem_runtime_ok
+    ExecShell \"open\" \"https://www.blackmagicdesign.com/support/family/atem-live-production-switchers\"
+  atem_runtime_ok:")
+
     set(CPACK_GENERATOR "NSIS")
     set(CPACK_PACKAGE_NAME "AtemColorAI")
     set(CPACK_PACKAGE_VENDOR "Gafana")
@@ -232,6 +329,8 @@ if(WIN32 AND BUILD_WINDOWS_INSTALLER)
     set(CPACK_NSIS_URL_INFO_ABOUT "https://github.com/Gafana/Atem-Color-AI")
     set(CPACK_NSIS_CONTACT "https://github.com/Gafana/Atem-Color-AI")
     atem_configure_cpack_nsis_shortcuts()
+    set(CPACK_NSIS_MUI_ICON "${CMAKE_SOURCE_DIR}/resources/icons/app-icon.ico")
+    set(CPACK_NSIS_MUI_UNIICON "${CMAKE_SOURCE_DIR}/resources/icons/app-icon.ico")
     # Do not append install dir to system PATH (long PATH breaks NSIS; app uses bundled layout).
     set(CPACK_NSIS_MODIFY_PATH OFF)
     set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
@@ -260,7 +359,29 @@ if(BUILD_TESTING)
         src/platform/AtemAppSettings.cpp
         src/platform/AtemPathValidation.cpp)
     target_include_directories(tst_atem_paths PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(tst_atem_paths PRIVATE ${QT_LIBS} ${QT_TEST_LIBS})
+    target_link_libraries(tst_atem_paths PRIVATE atem_color ${QT_LIBS} ${QT_TEST_LIBS})
     target_compile_definitions(tst_atem_paths PRIVATE QT_NO_KEYWORDS)
     add_test(NAME atem_paths COMMAND tst_atem_paths)
+
+    add_executable(tst_multiview tests/tst_multiview.cpp
+        src/capture/MultiviewGeometry.cpp)
+    target_include_directories(tst_multiview PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(tst_multiview PRIVATE ${QT_LIBS} ${QT_TEST_LIBS})
+    target_compile_definitions(tst_multiview PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME multiview COMMAND tst_multiview)
+
+    add_executable(tst_colortuning tests/tst_colortuning.cpp)
+    target_link_libraries(tst_colortuning PRIVATE atem_color ${QT_TEST_LIBS})
+    target_compile_definitions(tst_colortuning PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME colortuning COMMAND tst_colortuning)
+
+    add_executable(tst_matchengine tests/tst_matchengine.cpp)
+    target_link_libraries(tst_matchengine PRIVATE atem_color ${QT_TEST_LIBS})
+    target_compile_definitions(tst_matchengine PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME matchengine COMMAND tst_matchengine)
+
+    add_executable(tst_scopes tests/tst_scopes.cpp)
+    target_link_libraries(tst_scopes PRIVATE atem_color ${QT_TEST_LIBS})
+    target_compile_definitions(tst_scopes PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME scopes COMMAND tst_scopes)
 endif()

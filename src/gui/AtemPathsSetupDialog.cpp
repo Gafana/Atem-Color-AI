@@ -1,11 +1,13 @@
 #include "AtemPathsSetupDialog.h"
 
 #include "platform/AtemPathValidation.h"
+#include "platform/AtemRuntime.h"
 
 #include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
@@ -35,6 +37,18 @@ AtemPathsSetupDialog::AtemPathsSetupDialog(QWidget *parent)
 
     auto *layout = new QVBoxLayout(this);
 
+    auto *header = new QHBoxLayout();
+    auto *logo = new QLabel(this);
+    logo->setPixmap(QIcon(QStringLiteral(":/icons/app-icon.png")).pixmap(QSize(64, 64)));
+    logo->setFixedSize(64, 64);
+    auto *title = new QLabel(QStringLiteral("<span style=\"font-size:16pt;font-weight:600\">Atem Color AI</span>"
+                                            "<br>Сведение цвета камер Blackmagic через ATEM"),
+                             this);
+    header->addWidget(logo);
+    header->addSpacing(10);
+    header->addWidget(title, 1);
+    layout->addLayout(header);
+
     auto *intro = new QLabel(
         QStringLiteral(
             "Укажите установку <b>ATEM Software Control</b> (папку Blackmagic ATEM Switchers "
@@ -43,6 +57,22 @@ AtemPathsSetupDialog::AtemPathsSetupDialog(QWidget *parent)
         this);
     intro->setWordWrap(true);
     layout->addWidget(intro);
+
+    if (!AtemRuntime::isBlackmagicAtemRuntimeAvailable()) {
+        auto *missing = new QLabel(
+            QStringLiteral(
+                "<span style=\"color:#e0a030;font-weight:600\">ATEM Software Control не найден.</span> "
+                "Его нельзя включить в установщик (лицензия Blackmagic). Установите пакет "
+                "«ATEM Switchers» с сайта Blackmagic и перезапустите программу: "
+                "<a href=\"https://www.blackmagicdesign.com/support/family/atem-live-production-switchers\">"
+                "страница загрузки Blackmagic</a>. Для захвата нужен драйвер карты "
+                "(например, Desktop Video для DeckLink)."),
+            this);
+        missing->setWordWrap(true);
+        missing->setOpenExternalLinks(true);
+        missing->setTextFormat(Qt::RichText);
+        layout->addWidget(missing);
+    }
 
     auto *form = new QFormLayout();
 

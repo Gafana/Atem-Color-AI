@@ -27,6 +27,10 @@ public:
 
         m_connectedAddress = address;
         m_connected = true;
+        m_auxSource.insert(1001, 1);
+        m_auxSource.insert(1002, 2);
+        m_auxSource.insert(1003, 1);
+        m_programInput = 1;
         QThread::msleep(50);
         return {};
     }
@@ -53,6 +57,57 @@ public:
         };
     }
 
+    QVector<AtemAuxOutput> listAuxOutputs() override
+    {
+        if (!m_connected)
+            return {};
+        return {{1001, QStringLiteral("AUX 1")},
+                {1002, QStringLiteral("AUX 2")},
+                {1003, QStringLiteral("OUT 3")}};
+    }
+
+    QString auxSource(qint64 auxId, qint64 *sourceId) override
+    {
+        if (!m_connected)
+            return QStringLiteral("Not connected");
+        if (!m_auxSource.contains(auxId))
+            return QStringLiteral("AUX %1 not found").arg(auxId);
+        if (sourceId)
+            *sourceId = m_auxSource.value(auxId);
+        return {};
+    }
+
+    QString setAuxSource(qint64 auxId, qint64 sourceId) override
+    {
+        if (!m_connected)
+            return QStringLiteral("Not connected");
+        if (!m_auxSource.contains(auxId))
+            return QStringLiteral("AUX %1 not found").arg(auxId);
+        qCInfo(lcAtemMock).noquote()
+            << QStringLiteral("AUX %1: %2 -> %3").arg(auxId).arg(m_auxSource.value(auxId)).arg(sourceId);
+        m_auxSource[auxId] = sourceId;
+        return {};
+    }
+
+    QString programInput(qint64 *inputId) override
+    {
+        if (!m_connected)
+            return QStringLiteral("Not connected");
+        if (inputId)
+            *inputId = m_programInput;
+        return {};
+    }
+
+    QString setProgramInput(qint64 inputId) override
+    {
+        if (!m_connected)
+            return QStringLiteral("Not connected");
+        qCInfo(lcAtemMock).noquote()
+            << QStringLiteral("PGM: %1 -> %2").arg(m_programInput).arg(inputId);
+        m_programInput = inputId;
+        return {};
+    }
+
     QString readCorrectionBundle(qint64 destinationId, CameraCorrectionBundle &out) override
     {
         out = stateFor(destinationId).bundle;
@@ -61,16 +116,18 @@ public:
 
     QString applyCorrectionBundle(qint64 destinationId,
                                   const CameraCorrectionBundle &bundle,
-                                  CameraCorrectionBundle *previousOut) override
+                                  CameraCorrectionBundle *previousOut,
+                                  const CorrectionParameterMask *mask,
+                                  const QString &tuningMode) override
     {
         if (!m_connected)
             return QStringLiteral("Not connected");
-        return applyCorrectionBundleToClient(*this, destinationId, bundle, previousOut);
+        return applyCorrectionBundleToClient(*this, destinationId, bundle, previousOut, mask, tuningMode);
     }
 
     QString rollbackCorrection(qint64 destinationId, const CameraCorrectionBundle &previous) override
     {
-        return applyCorrectionBundle(destinationId, previous, nullptr);
+        return applyCorrectionBundle(destinationId, previous, nullptr, nullptr, QString());
     }
 
     QString setCameraFloats(qint64 destinationId,
@@ -107,6 +164,16 @@ public:
                 st.bundle.gainG = values[1];
                 st.bundle.gainB = values[2];
                 st.bundle.gainY = values[3];
+            } else if (parameter == kCcOffset && values.size() >= 4) {
+                st.bundle.offsetR = values[0];
+                st.bundle.offsetG = values[1];
+                st.bundle.offsetB = values[2];
+                st.bundle.offsetY = values[3];
+            } else if (parameter == kCcContrast && values.size() >= 2) {
+                st.bundle.contrastPivot = values[0];
+                st.bundle.contrastAdj = values[1];
+            } else if (parameter == kCcLumaMix && !values.isEmpty()) {
+                st.bundle.lumaMix = values[0];
             } else if (parameter == kCcColorAdjust && values.size() >= 2) {
                 st.bundle.hue = values[0];
                 st.bundle.saturation = values[1];
@@ -149,6 +216,13 @@ public:
         return {};
     }
 
+    QString triggerCameraAction(qint64 destinationId, uint8_t category, uint8_t parameter) override
+    {
+        qCInfo(lcAtemMock).noquote()
+            << QStringLiteral("Trigger dest=%1 cat=%2 param=%3").arg(destinationId).arg(category).arg(parameter);
+        return {};
+    }
+
 private:
     MockCameraState &stateFor(qint64 id)
     {
@@ -158,6 +232,8 @@ private:
     bool m_connected = false;
     QString m_connectedAddress;
     QHash<qint64, MockCameraState> m_states;
+    QHash<qint64, qint64> m_auxSource;
+    qint64 m_programInput = 1;
 };
 
 std::unique_ptr<AtemClient> createAtemClientMock()

@@ -66,6 +66,8 @@ function(install_gstreamer_bundle _gst_root)
         gstpng.dll gstsrt.dll gsttypefindfunctions.dll gstplayback.dll
         gstvideoparsersbad.dll gstjpeg.dll gstdshow.dll gstdecklink.dll
         gstcoretracers.dll gstpango.dll
+        # GStreamer >= 1.22: videoconvert + videoscale live in gstvideoconvertscale; capture sources
+        gstvideoconvertscale.dll gstwinks.dll gstmediafoundation.dll gstd3d11.dll gstautodetect.dll
     )
     foreach(_plug IN LISTS _bundle_plugins)
         if(EXISTS "${_gst_plugins}/${_plug}")

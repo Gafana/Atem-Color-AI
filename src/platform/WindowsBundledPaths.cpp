@@ -28,20 +28,29 @@ void primeBundledGStreamerEnv(const QString &appDir, bool configureRegistry)
     if (appDir.isEmpty())
         return;
 
-    QDir prefixDir(appDir);
-    if (!prefixDir.cdUp())
-        return;
-    const QString prefix = prefixDir.absolutePath();
-    const QString plugins = prefix + QStringLiteral("/lib/gstreamer-1.0");
-    if (!QDir(plugins).exists())
-        return;
+    // Two bundled layouts:
+    //  * installer (NSIS): <prefix>/bin/app.exe + <prefix>/lib/gstreamer-1.0 + <prefix>/libexec/gstreamer-1.0
+    //  * local build deploy (deploy-local.cmd): build/app.exe + build/gstreamer-1.0 (+ scanner inside)
+    QString prefix;
+    QString plugins = appDir + QStringLiteral("/gstreamer-1.0");
+    QString scanner = plugins + QStringLiteral("/gst-plugin-scanner.exe");
+    if (!QDir(plugins).exists()) {
+        QDir prefixDir(appDir);
+        if (!prefixDir.cdUp())
+            return;
+        prefix = prefixDir.absolutePath();
+        plugins = prefix + QStringLiteral("/lib/gstreamer-1.0");
+        scanner = prefix + QStringLiteral("/libexec/gstreamer-1.0/gst-plugin-scanner.exe");
+        if (!QDir(plugins).exists())
+            return;
+    } else {
+        prefix = appDir;
+    }
 
     const QByteArray pluginsUtf8 = QFile::encodeName(QDir::toNativeSeparators(plugins));
     qputenv("GST_PLUGIN_PATH", pluginsUtf8);
     qputenv("GST_PLUGIN_SYSTEM_PATH", pluginsUtf8);
 
-    const QString scanner =
-        prefix + QStringLiteral("/libexec/gstreamer-1.0/gst-plugin-scanner.exe");
     if (QFileInfo::exists(scanner))
         qputenv("GST_PLUGIN_SCANNER", QFile::encodeName(QDir::toNativeSeparators(scanner)));
 
