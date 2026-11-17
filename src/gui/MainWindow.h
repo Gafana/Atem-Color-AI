@@ -1,5 +1,7 @@
 #pragma once
 
+#include <QHash>
+
 #include "atem/AtemClient.h"
 #include "capture/VideoDevice.h"
 #include "color/ColorCheckerData.h"
@@ -37,6 +39,7 @@ struct CaptureRequest
     QString layout;
     bool pgmAllowed = false;
     QVector<CameraBinding> cameras;
+    QVector<bool> active; ///< only cameras marked «В подстройке» (+ the reference) are switched to / captured
     int referenceIndex = 0;
 };
 
@@ -115,6 +118,13 @@ private:
         QStringList notes;
         QStringList warnings;
         double errBefore = 0, errAfter = 0, deBefore = -1, deAfter = -1;
+        double lastMeanLuma = -1;     ///< encoded mean luma of the last capture (signal check)
+        // Iris probe (auto level): after an iris change the next capture checks the lens followed.
+        bool irisProbePending = false;
+        double irisProbeExpectStops = 0, irisProbeMeanBefore = 0, irisProbeAvBefore = -1;
+        int irisProbeDbBefore = 0;
+        float irisProbeGainYBefore = 1.0f;
+        bool irisUnresponsive = false; ///< lens did not follow: auto level uses gain instead
     };
 
     void rebuildAtemAvailabilityUi();
@@ -149,6 +159,15 @@ private:
     void loadEngineSettings();
     void saveEngineSettings();
     void readCurrentCameraValues();
+    /** Cameras that take part in this capture: «В подстройке» + the reference camera when the mode needs it. */
+    QVector<bool> captureActiveMask() const;
+    bool unlimitedMode() const;
+    bool modeNeedsReferenceCamera() const;
+    int sendProposals(const QVector<int> &indices, QString *errors);
+    void onAutoMatchLoop();
+    void continueAutoMatchLoop();
+    void finishAutoMatchLoop(const QString &why);
+    static void fitComboPopup(QComboBox *combo);
     void onSaveCameraPreset();
     void applyCameraPreset(const QString &name);
     void manageCameraPresets();
@@ -172,6 +191,7 @@ private:
     QVector<CameraRow> m_cameras;
     int m_referenceIndex = 0;
     bool m_loading = false;
+    bool m_mappingLoaded = false;
     bool m_busy = false;
     bool m_ipEdited = false;
     bool m_previewRunning = false;
@@ -212,6 +232,12 @@ private:
     QPushButton *m_btnApply = nullptr;
     QPushButton *m_btnCapture = nullptr;
     QPushButton *m_btnRollback = nullptr;
+    QPushButton *m_btnLoop = nullptr;
+    QLabel *m_corrDetails = nullptr;
+    // Closed-loop matching: capture → apply → settle → re-measure, ΔE history per camera (atemId).
+    int m_loopPass = 0; ///< 0 = off, otherwise number of the current measurement pass (1-based)
+    int m_loopMaxApplies = 3;
+    QHash<qint64, QVector<double>> m_loopHistory;
     QPushButton *m_btnConnect = nullptr;
     QPushButton *m_btnSaveRef = nullptr;
     QPushButton *m_btnLoadRef = nullptr;
@@ -228,6 +254,7 @@ private:
     class QCheckBox *m_chkFitGamma = nullptr;
     class QCheckBox *m_chkFitSat = nullptr;
     class QCheckBox *m_chkAutoIris = nullptr;
+    class QCheckBox *m_chkUnlimited = nullptr; ///< «Без ограничений (тест)»: no per-pass / cumulative limits
     QComboBox *m_balanceViaCombo = nullptr;
     QComboBox *m_exposureViaCombo = nullptr;
     QComboBox *m_chartCombo = nullptr;

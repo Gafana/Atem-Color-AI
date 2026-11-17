@@ -3,6 +3,8 @@
 #include <QtGlobal>
 
 #include <algorithm>
+#include <array>
+#include <vector>
 #include <cmath>
 
 using namespace ColorScience;
@@ -191,6 +193,20 @@ double linearRatioOfEncodedGain(double g, Transfer t)
     return a > 1e-9 ? b / a : 1.0;
 }
 
+// Inverse of linearRatioOfEncodedGain: encoded gain at mid-grey that gives the linear ratio @p r.
+double encodedGainOfLinearRatio(double r, Transfer t)
+{
+    const double a = decode(kMidGreyEncoded, t);
+    if (a * r >= 1.0)
+        return std::pow(r, 0.45);
+    return encode(a * std::max(0.0, r), t) / kMidGreyEncoded;
+}
+
+QString fNumber(double av)
+{
+    return QStringLiteral("f/%1").arg(std::sqrt(std::pow(2.0, av)), 0, 'f', 1);
+}
+
 } // namespace
 
 double ChannelCurve::apply(double x) const
@@ -297,7 +313,7 @@ Delta solve(const QVector<Pair> &pairsIn, const Settings &st)
             den += p.weight * mag * mag;
         }
         if (chromatic >= 4 && den > 1e-9)
-            d.saturation = std::max(0.6, std::min(1.6, num / den));
+            d.saturation = st.liveLimits ? std::max(0.6, std::min(1.6, num / den)) : std::max(0.05, num / den);
         else
             d.notes << QStringLiteral("насыщенность не считается: мало цветных образцов");
     }
@@ -311,6 +327,26 @@ Delta solve(const QVector<Pair> &pairsIn, const Settings &st)
     }
     d.saturation = std::pow(d.saturation, s);
 
+    if (st.liveLimits) {
+        bool limited = false;
+        const auto lim = [&](double v, double lo, double hi) {
+            const double c = std::clamp(v, lo, hi);
+            limited = limited || std::fabs(c - v) > 1e-9;
+            return c;
+        };
+        const double level = kLumaR * d.ch[0].gain + kLumaG * d.ch[1].gain + kLumaB * d.ch[2].gain;
+        const double lvl = lim(level, 0.75, 1.33); // encoded ≈ ±0.9 stop
+        for (int c = 0; c < 3; ++c) {
+            const double bal = level > 1e-6 ? d.ch[c].gain / level : 1.0;
+            d.ch[c].gain = lim(bal, 0.85, 1.18) * lvl;
+            d.ch[c].lift = lim(d.ch[c].lift, -0.05, 0.05);
+            d.ch[c].gamma = lim(d.ch[c].gamma, -0.15, 0.15);
+        }
+        d.saturation = lim(d.saturation, 0.85, 1.15);
+        if (limited)
+            d.notes << QStringLiteral("шаг ограничен (безопасно для эфира) — следующий проход уточнит");
+    }
+
     d.rmsBeforeIre = rmsIre(pairs, nullptr);
     d.rmsAfterIre = rmsIre(pairs, &d);
     d.deBefore = meanDeltaE(pairs, nullptr, st.transfer);
@@ -319,9 +355,10 @@ Delta solve(const QVector<Pair> &pairsIn, const Settings &st)
     return d;
 }
 
-CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d, const Settings &st,
+CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &dIn, const Settings &st,
                                QStringList *notes)
 {
+    Delta d = dIn;
     CameraCorrectionBundle out = cur;
     if (!d.valid)
         return out;
@@ -332,7 +369,53 @@ CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d
     double bal[3] = {g[0] / level, g[1] / level, g[2] / level};
     double levelForCc = level;
 
-    if (st.exposure && st.exposureVia != ExposureVia::CcGain && std::fabs(level - 1.0) > 1e-4) {
+    if (st.exposure && st.exposureVia == ExposureVia::Auto) {
+        // Light first. The current Gain Y is folded in too, so a level that an earlier pass (or a
+        // manual setting) put into Gain Y moves back to the iris / sensor gain.
+        const bool absorbY = std::fabs(std::log2(std::max(1e-6, linearRatioOfEncodedGain(cur.gainY, st.transfer))))
+                             > 0.1;
+        const double encTotal = level * (absorbY ? cur.gainY : 1.0);
+        const double stops = std::log2(std::max(1e-6, linearRatioOfEncodedGain(encTotal, st.transfer)));
+        const bool irisOk = st.irisUsable && cur.irisFStopAv >= 0.0f;
+        const LevelPlan plan = planAutoLevel(stops, irisOk ? cur.irisFStopAv : -1.0, cur.gainDb, irisOk,
+                                             !st.liveLimits);
+        if (plan.irisAv >= 0.0 && std::fabs(plan.irisAv - cur.irisFStopAv) > 1e-3)
+            out.irisFStopAv = static_cast<float>(plan.irisAv);
+        out.gainDb = plan.gainDb;
+        if (std::fabs(plan.appliedStops) > 0.5) {
+            // Exposure first: lift/gamma/saturation were fitted on a picture at the wrong level (live test:
+            // removing Lift Y in the same pass as +25 dB made a dark scene 5x darker) - next pass.
+            bool held = std::fabs(d.saturation - 1.0) > 1e-3;
+            for (int c = 0; c < 3; ++c) {
+                held = held || std::fabs(d.ch[c].lift) > 1e-4 || std::fabs(d.ch[c].gamma) > 1e-4;
+                d.ch[c].lift = 0.0;
+                d.ch[c].gamma = 0.0;
+            }
+            d.saturation = 1.0;
+            if (held && notes)
+                *notes << QStringLiteral("сначала свет: лифт/гамма/насыщенность — на следующем проходе");
+        }
+        const double achievedEnc = encodedGainOfLinearRatio(std::pow(2.0, plan.appliedStops), st.transfer);
+        // new Gain Y = current * wanted encoded change / change achieved with light
+        levelForCc = achievedEnc > 1e-6 ? level / achievedEnc : level;
+        if (notes) {
+            QStringList used;
+            if (std::fabs(out.irisFStopAv - cur.irisFStopAv) > 1e-3)
+                used << QStringLiteral("диафрагма %1 → %2").arg(fNumber(cur.irisFStopAv), fNumber(out.irisFStopAv));
+            if (out.gainDb != cur.gainDb)
+                used << QStringLiteral("усиление %1 → %2 dB").arg(cur.gainDb).arg(out.gainDb);
+            const double newY = cur.gainY * levelForCc;
+            if (std::fabs(newY - cur.gainY) > 0.005)
+                used << QStringLiteral("Gain Y %1 → %2").arg(cur.gainY, 0, 'f', 2).arg(newY, 0, 'f', 2);
+            *notes << QStringLiteral("авто-уровень (%1 ступ.): %2")
+                          .arg(stops, 0, 'f', 2)
+                          .arg(used.isEmpty() ? QStringLiteral("без изменений") : used.join(QStringLiteral(", ")));
+            if (cur.irisFStopAv >= 0.0f && !st.irisUsable)
+                *notes << QStringLiteral("диафрагма не реагирует — уровень через усиление");
+            else if (cur.irisFStopAv < 0.0f)
+                *notes << QStringLiteral("диафрагма камеры неизвестна — уровень через усиление");
+        }
+    } else if (st.exposure && st.exposureVia != ExposureVia::CcGain && std::fabs(level - 1.0) > 1e-4) {
         const double linear = linearRatioOfEncodedGain(level, st.transfer);
         const double stops = std::log2(std::max(1e-6, linear));
         if (st.exposureVia == ExposureVia::SensorGain) {
@@ -359,7 +442,45 @@ CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d
         }
     }
 
-    if (st.balance && st.balanceVia == BalanceVia::WhiteBalance) {
+    if (st.balance && st.balanceVia == BalanceVia::Auto) {
+        // Bulk cast -> camera white balance (on the sensor), residual -> RGB CC gain.
+        const Rgb m{linearRatioOfEncodedGain(bal[0] / bal[1], st.transfer), 1.0,
+                    linearRatioOfEncodedGain(bal[2] / bal[1], st.transfer)};
+        const double bulk = std::max(std::fabs(std::log(m.r)), std::fabs(std::log(m.b)));
+        if (bulk > 0.03) {
+            const double k0 = cur.whiteBalanceKelvin > 0 ? cur.whiteBalanceKelvin : 5600.0;
+            const Rgb w0 = planckianWhite(k0);
+            const double k1 = estimateKelvin(Rgb{w0.r / m.r, 1.0, w0.b / m.b});
+            int kOut = qBound(2500, static_cast<int>(std::lround(k1 / 50.0) * 50), 10000);
+            if (st.liveLimits)
+                kOut = qBound(static_cast<int>(k0) - 1000, kOut, static_cast<int>(k0) + 1000);
+            const Rgb w1 = planckianWhite(kOut);
+            const double ar = w0.r / w1.r;
+            const double ab = w0.b / w1.b;
+            const double rho = std::sqrt((m.r / ar) * (m.b / ab));
+            int tOut = qBound(-50, static_cast<int>(std::lround(cur.whiteBalanceTint + std::log(rho) / kTintPerUnit)), 50);
+            if (st.liveLimits)
+                tOut = qBound(cur.whiteBalanceTint - 10, tOut, cur.whiteBalanceTint + 10);
+            out.whiteBalanceKelvin = kOut;
+            out.whiteBalanceTint = tOut;
+            const double tf = std::exp(kTintPerUnit * (tOut - cur.whiteBalanceTint));
+            // The white balance takes the bulk; the CC residual is a trim (±25 %) - a larger residual means
+            // the estimate is unreliable (e.g. a noisy dark frame), the next pass refines it.
+            const double rr = std::clamp(encodedGainOfLinearRatio(m.r / (ar * tf), st.transfer), 0.8, 1.25);
+            const double rb = std::clamp(encodedGainOfLinearRatio(m.b / (ab * tf), st.transfer), 0.8, 1.25);
+            const double norm = kLumaR * rr + kLumaG + kLumaB * rb;
+            bal[0] = rr / norm;
+            bal[1] = 1.0 / norm;
+            bal[2] = rb / norm;
+            if (notes)
+                *notes << QStringLiteral("авто-цвет: ББ %1 K / tint %2 → %3 K / tint %4, остаток через CC Gain "
+                                         "R×%5 B×%6")
+                              .arg(cur.whiteBalanceKelvin).arg(cur.whiteBalanceTint).arg(kOut).arg(tOut)
+                              .arg(bal[0] / bal[1], 0, 'f', 3).arg(bal[2] / bal[1], 0, 'f', 3);
+        } else if (notes) {
+            *notes << QStringLiteral("авто-цвет: небольшой оттенок — только CC Gain");
+        }
+    } else if (st.balance && st.balanceVia == BalanceVia::WhiteBalance) {
         // Express the balance as a change of the camera's white balance (linear sensor gains).
         Rgb m{linearRatioOfEncodedGain(bal[0] / bal[1], st.transfer), 1.0,
               linearRatioOfEncodedGain(bal[2] / bal[1], st.transfer)};
@@ -375,6 +496,11 @@ CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d
         const int tint = static_cast<int>(std::lround(cur.whiteBalanceTint + std::log(rho) / kTintPerUnit));
         out.whiteBalanceKelvin = qBound(2500, static_cast<int>(std::lround(k1 / 50.0) * 50), 10000);
         out.whiteBalanceTint = qBound(-50, tint, 50);
+        if (st.liveLimits) {
+            const int kBase = static_cast<int>(k0);
+            out.whiteBalanceKelvin = qBound(kBase - 1000, out.whiteBalanceKelvin, kBase + 1000);
+            out.whiteBalanceTint = qBound(cur.whiteBalanceTint - 10, out.whiteBalanceTint, cur.whiteBalanceTint + 10);
+        }
         bal[0] = bal[1] = bal[2] = 1.0;
         if (notes)
             *notes << QStringLiteral("баланс через ББ камеры: %1 K / tint %2 → %3 K / tint %4")
@@ -388,19 +514,93 @@ CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d
     if (!st.exposure)
         levelForCc = 1.0;
 
-    out.gainR = static_cast<float>(cur.gainR * bal[0] * levelForCc);
-    out.gainG = static_cast<float>(cur.gainG * bal[1] * levelForCc);
-    out.gainB = static_cast<float>(cur.gainB * bal[2] * levelForCc);
-    out.liftR = static_cast<float>(cur.liftR + d.ch[0].lift);
-    out.liftG = static_cast<float>(cur.liftG + d.ch[1].lift);
-    out.liftB = static_cast<float>(cur.liftB + d.ch[2].lift);
-    out.gammaR = static_cast<float>(cur.gammaR + d.ch[0].gamma);
-    out.gammaG = static_cast<float>(cur.gammaG + d.ch[1].gamma);
-    out.gammaB = static_cast<float>(cur.gammaB + d.ch[2].gamma);
+    // Blackmagic cameras (Luma Mix 100 %, the default) keep the luminance when R/G/B lift/gamma/gain
+    // change - verified live on Micro Studio Camera 4K G2: R/G/B gain 1.23 -> 1.5 left the picture
+    // level unchanged, Y gain 1.0 -> 1.3 raised it. So colour goes to R/G/B, level/tone to Y.
+    out.gainR = static_cast<float>(cur.gainR * bal[0]);
+    out.gainG = static_cast<float>(cur.gainG * bal[1]);
+    out.gainB = static_cast<float>(cur.gainB * bal[2]);
+    out.gainY = static_cast<float>(cur.gainY * levelForCc);
+    const double liftCommon = kLumaR * d.ch[0].lift + kLumaG * d.ch[1].lift + kLumaB * d.ch[2].lift;
+    const double gammaCommon = kLumaR * d.ch[0].gamma + kLumaG * d.ch[1].gamma + kLumaB * d.ch[2].gamma;
+    out.liftR = static_cast<float>(cur.liftR + d.ch[0].lift - liftCommon);
+    out.liftG = static_cast<float>(cur.liftG + d.ch[1].lift - liftCommon);
+    out.liftB = static_cast<float>(cur.liftB + d.ch[2].lift - liftCommon);
+    out.liftY = static_cast<float>(cur.liftY + liftCommon);
+    out.gammaR = static_cast<float>(cur.gammaR + d.ch[0].gamma - gammaCommon);
+    out.gammaG = static_cast<float>(cur.gammaG + d.ch[1].gamma - gammaCommon);
+    out.gammaB = static_cast<float>(cur.gammaB + d.ch[2].gamma - gammaCommon);
+    out.gammaY = static_cast<float>(cur.gammaY + gammaCommon);
     if (st.saturation)
         out.saturation = static_cast<float>(cur.saturation * d.saturation);
     out.clamp();
     return out;
+}
+
+LevelPlan planAutoLevel(double stops, double currentAv, int currentDb, bool irisUsable, bool extended,
+                        double trimStops, int dbStep)
+{
+    dbStep = std::max(1, dbStep);
+    LevelPlan plan;
+    plan.irisAv = currentAv;
+    plan.gainDb = currentDb;
+    double rem = stops;
+    if (std::fabs(stops) < trimStops) {
+        plan.residualStops = stops;
+        return plan;
+    }
+    const bool iris = irisUsable && currentAv >= 0.0;
+    // Move the gain toward @p target (dB), at most by what is still needed (same sign only).
+    const auto useDb = [&](int target) {
+        const double room = (target - plan.gainDb) / 6.02;
+        if (std::fabs(rem) < 0.05 || room * rem <= 0.0)
+            return;
+        const double take = rem > 0 ? std::min(rem, room) : std::max(rem, room);
+        const int nd = static_cast<int>(std::lround((plan.gainDb + take * 6.02) / dbStep)) * dbStep;
+        if ((nd - plan.gainDb) * rem <= 0)
+            return; // less than one gain step: Gain Y trims it
+        rem -= (nd - plan.gainDb) / 6.02;
+        plan.gainDb = nd;
+    };
+    // Opening the iris (smaller Av) brightens: stops = currentAv - newAv.
+    const auto useIris = [&](double targetAv) {
+        if (!iris)
+            return;
+        const double room = plan.irisAv - targetAv;
+        if (std::fabs(rem) < 0.05 || room * rem <= 0.0)
+            return;
+        const double take = rem > 0 ? std::min(rem, room) : std::max(rem, room);
+        plan.irisAv -= take;
+        rem -= take;
+    };
+    if (stops > 0) {
+        useDb(0);      // negative gain costs dynamic range: back to 0 first
+        useIris(2.0);  // f/2
+        useDb(12);
+        useIris(1.0);  // f/1.4 (the lens clamps at its maximum aperture)
+        useDb(extended ? 36 : 24);
+    } else {
+        useDb(0);      // less gain = less noise
+        useIris(7.0);  // f/11
+        if (extended)
+            useIris(8.0); // f/16 (diffraction)
+    }
+    plan.appliedStops = stops - rem;
+    plan.residualStops = rem;
+    if (!iris)
+        plan.irisAv = currentAv;
+    return plan;
+}
+
+bool irisResponded(double meanBefore, double meanAfter, double expectedIrisStops, double otherStops,
+                   Transfer transfer)
+{
+    if (std::fabs(expectedIrisStops) < 0.25 || meanBefore <= 0.01 || meanAfter <= 0.01)
+        return true; // too small / too dark to tell
+    const double measured = std::log2(decode(meanAfter, transfer) / std::max(1e-6, decode(meanBefore, transfer)));
+    const double fromIris = measured - otherStops;
+    // the lens followed if at least a quarter of the expected change shows up, in the expected direction
+    return fromIris * expectedIrisStops > 0.0 && std::fabs(fromIris) >= 0.25 * std::fabs(expectedIrisStops);
 }
 
 QStringList sanityWarnings(const CameraCorrectionBundle &cur, const CameraCorrectionBundle &p)
@@ -412,6 +612,13 @@ QStringList sanityWarnings(const CameraCorrectionBundle &cur, const CameraCorrec
     for (int i = 0; i < 3; ++i)
         if (gains[i] < 0.6f || gains[i] > 1.6f)
             w << QStringLiteral("Gain %1 меняется в %2 раза").arg(QLatin1String(names[i])).arg(gains[i], 0, 'f', 2);
+    const float gy = ratio(p.gainY, cur.gainY);
+    if (gy < 0.6f || gy > 1.6f)
+        w << QStringLiteral("Gain Y (уровень) меняется в %1 раза").arg(gy, 0, 'f', 2);
+    if (std::fabs(p.liftY - cur.liftY) > 0.15f)
+        w << QStringLiteral("Lift Y сдвигается на %1").arg(p.liftY - cur.liftY, 0, 'f', 3);
+    if (std::fabs(p.gammaY - cur.gammaY) > 0.35f)
+        w << QStringLiteral("Gamma Y сдвигается на %1").arg(p.gammaY - cur.gammaY, 0, 'f', 3);
     const float lifts[3] = {p.liftR - cur.liftR, p.liftG - cur.liftG, p.liftB - cur.liftB};
     for (int i = 0; i < 3; ++i)
         if (std::fabs(lifts[i]) > 0.15f)
@@ -510,12 +717,87 @@ Rgb regionMean(const QImage &imageIn, const QRect &rectIn)
     return out;
 }
 
-QVector<Pair> autoPairs(const QImage &imageIn, const Settings &st, double targetGreyIre, AutoEstimate *est,
-                        QStringList *notes)
+SignalCheck checkSignal(const QImage &imageIn)
 {
-    QVector<Pair> out;
+    SignalCheck s;
+    if (imageIn.isNull()) {
+        s.noSignal = true;
+        s.reason = QStringLiteral("нет кадра");
+        return s;
+    }
+    // Fast (nearest) downscale keeps the sensor noise that tells a dark scene from a dead input.
+    QImage image = imageIn.width() > 480 ? imageIn.scaledToWidth(480, Qt::FastTransformation) : imageIn;
+    if (image.format() != QImage::Format_RGB32)
+        image = image.convertToFormat(QImage::Format_RGB32);
+    const int w = image.width();
+    const int h = image.height();
+    std::array<qint64, 256> hist{};
+    double sum = 0.0, sum2 = 0.0, detail = 0.0;
+    qint64 n = 0, dn = 0;
+    QVector<int> prev(w, 0);
+    for (int y = 0; y < h; ++y) {
+        const QRgb *row = reinterpret_cast<const QRgb *>(image.constScanLine(y));
+        int left = 0;
+        for (int x = 0; x < w; ++x) {
+            const int l = (54 * qRed(row[x]) + 183 * qGreen(row[x]) + 19 * qBlue(row[x]) + 128) >> 8;
+            ++hist[static_cast<size_t>(std::clamp(l, 0, 255))];
+            sum += l;
+            sum2 += static_cast<double>(l) * l;
+            ++n;
+            if (x > 0) {
+                detail += std::abs(l - left);
+                ++dn;
+            }
+            if (y > 0) {
+                detail += std::abs(l - prev[x]);
+                ++dn;
+            }
+            left = l;
+            prev[x] = l;
+        }
+    }
+    if (n == 0) {
+        s.noSignal = true;
+        s.reason = QStringLiteral("нет кадра");
+        return s;
+    }
+    const auto quant = [&](double p) {
+        const double target = p * static_cast<double>(n);
+        qint64 acc = 0;
+        for (int i = 0; i < 256; ++i) {
+            acc += hist[static_cast<size_t>(i)];
+            if (acc >= target)
+                return i / 255.0;
+        }
+        return 1.0;
+    };
+    const double mean = sum / static_cast<double>(n);
+    s.meanLuma = mean / 255.0;
+    s.stdLuma = std::sqrt(std::max(0.0, sum2 / static_cast<double>(n) - mean * mean)) / 255.0;
+    s.detail = dn > 0 ? detail / static_cast<double>(dn) / 255.0 : 0.0;
+    s.p95Luma = quant(0.95);
+    s.p99Luma = quant(0.99);
+    const bool flat = s.stdLuma < 0.8 / 255.0 && s.detail < 0.5 / 255.0;
+    const bool black = s.p99Luma < 4.0 / 255.0;
+    if (flat || black) {
+        s.noSignal = true;
+        s.reason = black ? QStringLiteral("чёрный кадр без деталей — нет сигнала на входе?")
+                         : QStringLiteral("однородный кадр без деталей — нет сигнала на входе?");
+        return s;
+    }
+    if (s.meanLuma < 0.12 || s.p95Luma < 0.30) {
+        s.lowLight = true;
+        s.reason = QStringLiteral("мало света (средний уровень %1 IRE) — расчёт менее точный")
+                       .arg(s.meanLuma * 100.0, 0, 'f', 0);
+    }
+    return s;
+}
+
+SceneStats sceneStats(const QImage &imageIn, Transfer transfer, QStringList *notes)
+{
+    SceneStats st;
     if (imageIn.isNull())
-        return out;
+        return st;
     QImage image = imageIn.width() > 480 ? imageIn.scaledToWidth(480, Qt::SmoothTransformation) : imageIn;
     if (image.format() != QImage::Format_RGB32)
         image = image.convertToFormat(QImage::Format_RGB32);
@@ -526,64 +808,141 @@ QVector<Pair> autoPairs(const QImage &imageIn, const Settings &st, double target
     };
     QVector<Px> valid;
     QVector<double> lumas;
+    lumas.reserve(image.width() * image.height());
     double logSum = 0.0;
     int logN = 0;
     for (int yy = 0; yy < image.height(); ++yy) {
         const QRgb *row = reinterpret_cast<const QRgb *>(image.constScanLine(yy));
         for (int x = 0; x < image.width(); ++x) {
             const Rgb e{qRed(row[x]) / 255.0, qGreen(row[x]) / 255.0, qBlue(row[x]) / 255.0};
-            const Rgb lin = decode(e, st.transfer);
+            const Rgb lin = decode(e, transfer);
             const double y = luma(lin);
             lumas << y;
             logSum += std::log(std::max(1e-4, y));
             ++logN;
             const double mx = std::max({e.r, e.g, e.b});
             const double ey = luma(e);
-            if (mx < 0.97 && ey > 0.08 && ey < 0.95)
+            // ≥3 % code: dark (dim room) pictures still contribute; noise floor and clipping excluded
+            if (mx < 0.97 && ey > 0.03 && ey < 0.95)
                 valid << Px{lin, y};
         }
     }
     if (lumas.isEmpty())
-        return out;
-    // A black / no-signal frame must not produce a correction (it would ask for +4 stops).
-    if (valid.size() < lumas.size() / 100) {
+        return st;
+    if (valid.size() < lumas.size() / 200) {
         if (notes)
-            *notes << QStringLiteral("кадр почти чёрный или пересвечен — нет сигнала? поправка не рассчитана");
-        return out;
+            *notes << QStringLiteral("кадр почти чёрный или пересвечен — поправка не рассчитана");
+        return st;
     }
     std::sort(lumas.begin(), lumas.end());
-    const double key = std::exp(logSum / std::max(1, logN));
-    const double p98 = lumas[static_cast<int>(0.98 * (lumas.size() - 1))];
+    const auto q = [&](double p) { return lumas[static_cast<int>(p * (lumas.size() - 1))]; };
+    st.keyLinear = std::exp(logSum / std::max(1, logN));
+    st.p25Linear = q(0.25);
+    st.p50Linear = q(0.50);
+    st.p75Linear = q(0.75);
+    st.p90Linear = q(0.90);
+    st.p98Linear = q(0.98);
 
-    // Illuminant: bright-weighted mean of near-neutral pixels, refined twice (grey-edge/white-patch hybrid).
+    // Illuminant. Neutral surfaces (walls, grey/white objects) all share the chromaticity of the light,
+    // so they form the densest compact cluster in log-chroma space (u = ln R/G, v = ln B/G) close to the
+    // Planckian locus; coloured objects are spread out. The peak of a luminance-weighted 2-D histogram
+    // restricted to a band around the locus is found first, then refined by the mean of the pixels
+    // around it. Falls back to a grey-world start when no candidate exists (coloured stage light).
     Rgb ill{1.0, 1.0, 1.0};
     double neutralFraction = 0.0;
-    for (int pass = 0; pass < 3; ++pass) {
-        double sr = 0.0, sg = 0.0, sb = 0.0, sw = 0.0;
-        int n = 0;
-        const double chromaMax = pass == 0 ? 1e9 : (pass == 1 ? 0.35 : 0.18);
-        for (const Px &p : valid) {
-            const Rgb q{p.lin.r / ill.r, p.lin.g / ill.g, p.lin.b / ill.b};
-            const double mx = std::max({q.r, q.g, q.b});
-            const double mn = std::min({q.r, q.g, q.b});
-            if (mx <= 1e-6 || (mx - mn) / mx > chromaMax)
+    {
+        constexpr int kBins = 64;
+        constexpr double kLo = -1.6, kHi = 1.6;
+        constexpr double kStep = (kHi - kLo) / kBins;
+        static const QVector<std::pair<double, double>> locus = [] {
+            QVector<std::pair<double, double>> pts;
+            const Rgb ref = planckianWhite(6500.0);
+            for (double k = 2000.0; k <= 15000.0; k += 250.0) {
+                const Rgb w = planckianWhite(k);
+                pts.push_back({std::log((w.r / ref.r) / (w.g / ref.g)), std::log((w.b / ref.b) / (w.g / ref.g))});
+            }
+            return pts;
+        }();
+        const auto nearLocus = [&](double u, double v) {
+            double best = 1e9;
+            for (const auto &pt : locus)
+                best = std::min(best, std::hypot(u - pt.first, v - pt.second));
+            return best < 0.25;
+        };
+        std::vector<double> hist(static_cast<size_t>(kBins * kBins), 0.0);
+        std::vector<double> us(static_cast<size_t>(valid.size())), vs(static_cast<size_t>(valid.size()));
+        for (int i = 0; i < valid.size(); ++i) {
+            const Px &p = valid.at(i);
+            const double g = std::max(1e-5, p.lin.g);
+            const double u = std::log(std::max(1e-5, p.lin.r) / g);
+            const double v = std::log(std::max(1e-5, p.lin.b) / g);
+            us[static_cast<size_t>(i)] = u;
+            vs[static_cast<size_t>(i)] = v;
+            const int bu = static_cast<int>((u - kLo) / kStep);
+            const int bv = static_cast<int>((v - kLo) / kStep);
+            if (bu < 0 || bv < 0 || bu >= kBins || bv >= kBins)
                 continue;
-            const double w = p.y; // bright pixels describe the illuminant better
-            sr += w * p.lin.r;
-            sg += w * p.lin.g;
-            sb += w * p.lin.b;
-            sw += w;
-            ++n;
+            hist[static_cast<size_t>(bv * kBins + bu)] += std::sqrt(p.y);
         }
-        if (n < 50 || sw <= 0.0)
-            break;
-        const Rgb next{sr / sw, sg / sw, sb / sw};
-        const double ny = luma(next);
-        if (ny <= 1e-9)
-            break;
-        ill = {next.r / ny, next.g / ny, next.b / ny};
-        neutralFraction = static_cast<double>(n) / std::max(1, static_cast<int>(valid.size()));
+        double bestScore = 0.0;
+        double peakU = 0.0, peakV = 0.0;
+        bool havePeak = false;
+        for (int bv = 1; bv < kBins - 1; ++bv)
+            for (int bu = 1; bu < kBins - 1; ++bu) {
+                const double cu = kLo + (bu + 0.5) * kStep;
+                const double cv = kLo + (bv + 0.5) * kStep;
+                double score = 0.0;
+                for (int dv = -1; dv <= 1; ++dv)
+                    for (int du = -1; du <= 1; ++du)
+                        score += hist[static_cast<size_t>((bv + dv) * kBins + bu + du)];
+                if (score > bestScore && nearLocus(cu, cv)) {
+                    bestScore = score;
+                    peakU = cu;
+                    peakV = cv;
+                    havePeak = true;
+                }
+            }
+        if (havePeak) {
+            // refine twice: mean of the cluster around the peak (bright-weighted)
+            for (int pass = 0; pass < 2; ++pass) {
+                double su = 0.0, sv = 0.0, sw = 0.0;
+                int n = 0;
+                const double radius = pass == 0 ? 0.12 : 0.08;
+                for (int i = 0; i < valid.size(); ++i) {
+                    const double du = us[static_cast<size_t>(i)] - peakU;
+                    const double dv = vs[static_cast<size_t>(i)] - peakV;
+                    if (du * du + dv * dv > radius * radius)
+                        continue;
+                    const double w = valid.at(i).y;
+                    su += w * us[static_cast<size_t>(i)];
+                    sv += w * vs[static_cast<size_t>(i)];
+                    sw += w;
+                    ++n;
+                }
+                if (n < 30 || sw <= 0.0)
+                    break;
+                peakU = su / sw;
+                peakV = sv / sw;
+                neutralFraction = static_cast<double>(n) / std::max(1, static_cast<int>(valid.size()));
+            }
+            const Rgb est{std::exp(peakU), 1.0, std::exp(peakV)};
+            const double ny = luma(est);
+            ill = {est.r / ny, est.g / ny, est.b / ny};
+        } else {
+            double sr = 0.0, sg = 0.0, sb = 0.0;
+            for (const Px &p : valid) {
+                sr += p.lin.r;
+                sg += p.lin.g;
+                sb += p.lin.b;
+            }
+            const Rgb gw{sr, sg, sb};
+            const double ny = luma(gw);
+            if (ny > 1e-9)
+                ill = {gw.r / ny, gw.g / ny, gw.b / ny};
+            neutralFraction = 0.0;
+        }
     }
+    st.illuminantRaw = ill;
     // Confidence: few neutral pixels (coloured stage light, saturated scene) means the estimate is
     // mostly "grey world" and unreliable -> pull it towards neutral instead of over-correcting.
     const double confidence = std::clamp(neutralFraction / 0.10, 0.25, 1.0);
@@ -604,6 +963,99 @@ QVector<Pair> autoPairs(const QImage &imageIn, const Settings &st, double target
         if (limited && notes)
             *notes << QStringLiteral("оценка цвета света вне правдоподобного диапазона — поправка ограничена");
     }
+    st.illuminant = ill;
+    st.neutralFraction = neutralFraction;
+
+    // Median chroma of mid-tones once the light is neutralised (for a conservative saturation match).
+    QVector<double> chroma;
+    for (const Px &p : valid) {
+        if (p.y < 0.02 || p.y > 0.7)
+            continue;
+        const Rgb e = encode(Rgb{p.lin.r / ill.r, p.lin.g / ill.g, p.lin.b / ill.b}, transfer);
+        chroma << (std::max({e.r, e.g, e.b}) - std::min({e.r, e.g, e.b}));
+    }
+    if (chroma.size() >= 50) {
+        std::nth_element(chroma.begin(), chroma.begin() + chroma.size() / 2, chroma.end());
+        st.medianChroma = chroma[chroma.size() / 2];
+    }
+    st.valid = true;
+    return st;
+}
+
+ReferenceMatch referenceMatch(const SceneStats &cam, const SceneStats &ref, const Settings &st, QStringList *notes)
+{
+    ReferenceMatch out;
+    if (!cam.valid || !ref.valid)
+        return out;
+    // 1) colour of the light: the camera should render white the way the reference renders it.
+    // Raw estimates: both cameras see the same light, the confidence pull must not bias one of them.
+    const Rgb camIll = cam.illuminantRaw;
+    const Rgb wantIll = st.balance ? ref.illuminantRaw : camIll;
+    // 2) exposure: geometric mean of median and log-average ratios (robust to a few bright objects).
+    double factor = 1.0;
+    if (st.exposure) {
+        const double rm = cam.p50Linear > 1e-5 ? ref.p50Linear / cam.p50Linear : 1.0;
+        const double rk = cam.keyLinear > 1e-5 ? ref.keyLinear / cam.keyLinear : 1.0;
+        factor = std::sqrt(std::max(1e-3, rm) * std::max(1e-3, rk));
+        if (factor > 1.0 && cam.p98Linear * factor > 0.9) {
+            factor = std::max(1.0, 0.9 / std::max(1e-6, cam.p98Linear));
+            if (notes)
+                *notes << QStringLiteral("уровень ограничен, чтобы не пересветить светлые участки");
+        }
+        if (st.liveLimits && (factor > 2.0 || factor < 0.5)) {
+            factor = std::clamp(factor, 0.5, 2.0);
+            if (notes)
+                *notes << QStringLiteral("уровень ограничен ±1 ступенью за проход");
+        }
+    }
+    const double grey = decode(kMidGreyEncoded, st.transfer);
+    const auto lightPair = [&](double level, double targetLevel, double weight) {
+        Pair p;
+        p.measured = encode(Rgb{camIll.r * level, camIll.g * level, camIll.b * level}, st.transfer);
+        p.target = encode(Rgb{wantIll.r * targetLevel, wantIll.g * targetLevel, wantIll.b * targetLevel},
+                          st.transfer);
+        p.neutral = true;
+        p.weight = weight;
+        return p;
+    };
+    // Grey seen by this camera vs the same grey seen by the reference (scene independent).
+    out.pairs << lightPair(grey / std::max(1e-6, factor), grey, 3.0);
+    // 3) tone (only when lift/gamma are enabled): luma percentiles, low weight - exact only if both
+    //    cameras see a similar scene.
+    if (st.lift || st.gamma) {
+        const double cq[4] = {cam.p25Linear, cam.p50Linear, cam.p75Linear, cam.p90Linear};
+        const double rq[4] = {ref.p25Linear, ref.p50Linear, ref.p75Linear, ref.p90Linear};
+        for (int i = 0; i < 4; ++i)
+            if (cq[i] > 1e-4 && rq[i] > 1e-4 && cq[i] < 0.95 && rq[i] < 0.95)
+                out.pairs << lightPair(cq[i], st.exposure ? rq[i] : cq[i], 0.5);
+        if (notes)
+            *notes << QStringLiteral("лифт/гамма по распределению яркости — точны, только если камеры видят похожую сцену");
+    }
+    // 4) saturation: median chroma ratio, conservative.
+    if (st.saturation && cam.medianChroma > 0.01 && ref.medianChroma > 0.01)
+        out.saturation = st.liveLimits ? std::clamp(ref.medianChroma / cam.medianChroma, 0.85, 1.15)
+                                       : ref.medianChroma / cam.medianChroma; // camera range clamps later
+    return out;
+}
+
+QVector<Pair> autoPairs(const QImage &imageIn, const Settings &st, double targetGreyIre, AutoEstimate *est,
+                        QStringList *notes)
+{
+    QVector<Pair> out;
+    if (imageIn.isNull())
+        return out;
+    const SignalCheck signal = checkSignal(imageIn);
+    if (signal.noSignal) {
+        if (notes)
+            *notes << signal.reason + QStringLiteral(" Поправка не рассчитана.");
+        return out;
+    }
+    const SceneStats scene = sceneStats(imageIn, st.transfer, notes);
+    if (!scene.valid)
+        return out;
+    const Rgb ill = scene.illuminant;
+    const double key = scene.keyLinear;
+    const double p98 = scene.p98Linear;
 
     const double targetLin = decode(targetGreyIre / 100.0, st.transfer);
     double factor = key > 1e-6 ? targetLin / key : 1.0;
@@ -613,7 +1065,7 @@ QVector<Pair> autoPairs(const QImage &imageIn, const Settings &st, double target
             *notes << QStringLiteral("уровень ограничен, чтобы не пересветить светлые участки");
     }
     // Live-safe step: at most ±1 stop of linear light per pass; repeated passes converge.
-    if (factor > 2.0 || factor < 0.5) {
+    if (st.liveLimits && (factor > 2.0 || factor < 0.5)) {
         factor = std::clamp(factor, 0.5, 2.0);
         if (notes)
             *notes << QStringLiteral("уровень ограничен ±1 ступенью за один проход — повторите захват");
@@ -633,7 +1085,7 @@ QVector<Pair> autoPairs(const QImage &imageIn, const Settings &st, double target
         est->illuminantLinear = ill;
         est->keyLinear = key;
         est->p98Linear = p98;
-        est->neutralFraction = neutralFraction;
+        est->neutralFraction = scene.neutralFraction;
     }
     return out;
 }

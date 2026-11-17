@@ -81,8 +81,10 @@ inline QString colorMatchModeHint(ColorMatchMode mode)
 {
     switch (mode) {
     case ColorMatchMode::ReferenceCamera:
-        return QStringLiteral("Камеры подгоняются по цвету и яркости под эталонную (сравниваются распределения "
-                              "R/G/B по кадру или по выделенной области). Лучше, когда камеры видят похожую сцену.");
+        return QStringLiteral("Камеры подгоняются под эталонную: сначала цвет света (ББ/tint по нейтральным "
+                              "участкам), затем уровень (медиана яркости), лифт/гамма/насыщенность — осторожно и "
+                              "только если включены. Сцены могут отличаться; для точности выделите общую область. "
+                              "«Авто-подгонка» уточняет за несколько проходов.");
     case ColorMatchMode::ReferenceFrame:
         return QStringLiteral("Камеры подгоняются под сохранённый кадр-эталон.");
     case ColorMatchMode::GrayCard:

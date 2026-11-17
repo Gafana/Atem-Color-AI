@@ -33,6 +33,7 @@ enum class BalanceVia
 {
     CcGain,       ///< colour correction RGB gain (8.2) - exact, predictable
     WhiteBalance, ///< camera white balance Kelvin / tint (1.2) - physically on the sensor
+    Auto,         ///< white balance K/tint for the bulk cast, RGB CC gain for the residual
 };
 
 enum class ExposureVia
@@ -40,6 +41,7 @@ enum class ExposureVia
     CcGain,     ///< colour correction gain (all channels)
     SensorGain, ///< video gain in dB (1.13)
     Iris,       ///< lens aperture (0.2), needs a lens with electronic iris
+    Auto,       ///< light first: iris (sensible range), then sensor gain dB (kept low), Gain Y only to trim
 };
 
 struct Settings
@@ -52,6 +54,13 @@ struct Settings
     BalanceVia balanceVia = BalanceVia::CcGain;
     ExposureVia exposureVia = ExposureVia::CcGain;
     double strength = 1.0;  ///< 0..1 fraction of the computed change that is applied
+    /** Live-safe per-pass limits (closed loop converges in several passes instead of one wild jump):
+     *  colour balance −15/+18 % per channel, level ≈ ±0.9 stop, lift ±0.05, gamma ±0.15, saturation ±15 %,
+     *  camera white balance ±1000 K / tint ±10, exposure ±1 stop. When off (test mode «Без ограничений»)
+     *  only the camera's own parameter ranges apply. */
+    bool liveLimits = false;
+    /** Auto level may use the lens iris (false when the lens is not controllable / did not follow). */
+    bool irisUsable = true;
     ColorScience::Transfer transfer = ColorScience::Transfer::Bt709Oetf;
 };
 
@@ -87,6 +96,28 @@ Delta solve(const QVector<Pair> &pairs, const Settings &settings);
 CameraCorrectionBundle compose(const CameraCorrectionBundle &current, const Delta &delta,
                                const Settings &settings, QStringList *notes = nullptr);
 
+/** Auto exposure split: how a level change (in stops of light, + = brighter) is spread over the
+ *  lens iris and the sensor gain. Order when brightening: negative dB back to 0, iris open to f/2,
+ *  gain up to +12 dB, iris to f/1.4, gain up to +24 dB (+36 with @p extended). When darkening:
+ *  gain down to 0 dB (less noise), iris closed to f/11 (f/16 with @p extended). What is left
+ *  (and small changes below @p trimStops) stays for CC Gain Y. */
+struct LevelPlan
+{
+    double irisAv = -1;     ///< new aperture value (Av = log2 N²), -1 = unknown / unchanged
+    int gainDb = 0;
+    double appliedStops = 0;///< light change achieved by iris + gain
+    double residualStops = 0;
+};
+/** Micro Studio Camera 4K G2 applies sensor gain in 6 dB steps (live test: 18 = 21 dB, 24 = 25 = 27 dB). */
+LevelPlan planAutoLevel(double stops, double currentAv, int currentDb, bool irisUsable, bool extended,
+                        double trimStops = 0.2, int dbStep = 6);
+
+/** Did the lens follow an iris change? @p meanBefore / @p meanAfter are encoded mean lumas,
+ *  @p expectedIrisStops the expected brightening from the iris, @p otherStops the known change from
+ *  other controls (gain dB, Gain Y) between the two captures. */
+bool irisResponded(double meanBefore, double meanAfter, double expectedIrisStops, double otherStops,
+                   ColorScience::Transfer transfer = ColorScience::Transfer::Bt709Oetf);
+
 /** Human readable reasons why a proposed change looks suspicious (empty = looks sane). */
 QStringList sanityWarnings(const CameraCorrectionBundle &current, const CameraCorrectionBundle &proposed);
 
@@ -110,6 +141,47 @@ struct AutoEstimate
     double neutralFraction = 0;
     double estimatedKelvinShift = 0;
 };
+
+/** Signal sanity of a captured frame. "No signal" means an essentially constant frame (black input,
+ *  empty ATEM source, frozen colour) - a dark but real scene still has detail and sensor noise. */
+struct SignalCheck
+{
+    bool noSignal = false;
+    bool lowLight = false;   ///< real picture, but dark: matching is less reliable
+    double meanLuma = 0;     ///< encoded 0..1
+    double p95Luma = 0;
+    double p99Luma = 0;
+    double stdLuma = 0;      ///< encoded 0..1
+    double detail = 0;       ///< mean absolute neighbour difference, encoded 0..1
+    QString reason;          ///< human readable reason when noSignal / lowLight
+};
+SignalCheck checkSignal(const QImage &image);
+
+/** Robust, scene-independent statistics of one camera picture. */
+struct SceneStats
+{
+    bool valid = false;
+    Rgb illuminant{1.0, 1.0, 1.0};    ///< estimated white (linear, luma 1), confidence-limited (absolute use)
+    Rgb illuminantRaw{1.0, 1.0, 1.0}; ///< same estimate without the confidence pull (camera-to-camera use)
+    double neutralFraction = 0;
+    double keyLinear = 0;          ///< log-average luma (linear)
+    double p25Linear = 0, p50Linear = 0, p75Linear = 0, p90Linear = 0, p98Linear = 0;
+    double medianChroma = 0;       ///< median chroma (encoded) of mid-tone pixels after neutralising the light
+};
+SceneStats sceneStats(const QImage &image, ColorScience::Transfer transfer, QStringList *notes = nullptr);
+
+struct ReferenceMatch
+{
+    QVector<Pair> pairs;
+    double saturation = 1.0; ///< relative saturation change (only meaningful when settings.saturation)
+};
+
+/** Reference camera / reference frame: cameras usually see different parts of the scene, so whole-frame
+ *  histograms are not comparable. Instead the colour of the light (white balance + tint), then the
+ *  exposure (median / log-average level) and only then - if enabled - tone (lift/gamma from luma
+ *  percentiles) and saturation (median chroma) are matched, each conservatively. */
+ReferenceMatch referenceMatch(const SceneStats &camera, const SceneStats &reference, const Settings &settings,
+                              QStringList *notes = nullptr);
 
 /** Automatic mode: pairs that neutralise the estimated illuminant and bring the scene key to
  *  @p targetGreyIre (mid-grey level, e.g. 41 IRE for 18 % grey through BT.709), protecting

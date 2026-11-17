@@ -3,6 +3,7 @@
 #include "color/CorrectionParameterMask.h"
 
 #include <QLoggingCategory>
+#include <QThread>
 #include <cmath>
 
 Q_LOGGING_CATEGORY(lcCamApply, "atem.camera")
@@ -59,6 +60,7 @@ QString applyCorrectionBundleToClient(AtemClient &client,
                                  .arg(QString::number(destinationId), name, values);
         if (stepErr.isEmpty()) {
             qCInfo(lcCamApply).noquote() << QStringLiteral("sent ") + modeTag + line;
+            QThread::msleep(40); // pace camera control commands (the camera may drop a burst)
             return;
         }
         qCWarning(lcCamApply).noquote() << QStringLiteral("send failed ") + line + QStringLiteral(": ") + stepErr;
@@ -72,6 +74,15 @@ QString applyCorrectionBundleToClient(AtemClient &client,
     const CorrectionParameterMask m = mask ? *mask : CorrectionParameterMask::allEnabled();
     const CameraCorrectionBundle &b = bundle;
     const CameraCorrectionBundle &p = previous;
+
+    // Light controls first. Live test (Micro Studio 4K G2 via ATEM): with CC gain + white balance + sensor
+    // gain sent back to back, the sensor gain was sometimes not applied; commands are also paced.
+    if (m.level && changed(b.gainDb != p.gainDb))
+        send(QStringLiteral("gainDb"), QString::number(b.gainDb), client.setCameraGainDb(destinationId, b.gainDb));
+
+    if (m.iris && b.irisFStopAv >= 0.0f && changed(differs(b.irisFStopAv, p.irisFStopAv, 0.01f)))
+        send(QStringLiteral("iris"), QStringLiteral("AV=%1").arg(b.irisFStopAv, 0, 'f', 3),
+             client.setCameraFloats(destinationId, kCategoryLens, kLensApertureFStop, {b.irisFStopAv}));
 
     if (m.lift && changed(differs4(b.liftR, b.liftG, b.liftB, b.liftY, p.liftR, p.liftG, p.liftB, p.liftY)))
         send(QStringLiteral("lift"), values4(b.liftR, b.liftG, b.liftB, b.liftY),
@@ -118,12 +129,6 @@ QString applyCorrectionBundleToClient(AtemClient &client,
             send(QStringLiteral("wb"), QStringLiteral("kelvin=%1,tint=%2").arg(kelvin).arg(tint),
                  client.setCameraInt16Pair(destinationId, kCategoryVideo, kVideoManualWhiteBalance, kelvin, tint));
     }
-    if (m.level && changed(b.gainDb != p.gainDb))
-        send(QStringLiteral("gainDb"), QString::number(b.gainDb), client.setCameraGainDb(destinationId, b.gainDb));
-
-    if (m.iris && b.irisFStopAv >= 0.0f && changed(differs(b.irisFStopAv, p.irisFStopAv, 0.01f)))
-        send(QStringLiteral("iris"), QStringLiteral("AV=%1").arg(b.irisFStopAv, 0, 'f', 3),
-             client.setCameraFloats(destinationId, kCategoryLens, kLensApertureFStop, {b.irisFStopAv}));
 
     if (sentCount == 0)
         qCInfo(lcCamApply).noquote() << QStringLiteral("no changes ") + modeTag
