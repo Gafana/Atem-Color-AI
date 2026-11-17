@@ -54,7 +54,8 @@ struct Settings
     double strength = 1.0;  ///< 0..1 fraction of the computed change that is applied
     /** Live-safe per-pass limits (closed loop converges in several passes instead of one wild jump):
      *  colour balance −15/+18 % per channel, level ≈ ±0.9 stop, lift ±0.05, gamma ±0.15, saturation ±15 %,
-     *  camera white balance ±1000 K / tint ±10. */
+     *  camera white balance ±1000 K / tint ±10, exposure ±1 stop. When off (test mode «Без ограничений»)
+     *  only the camera's own parameter ranges apply. */
     bool liveLimits = false;
     ColorScience::Transfer transfer = ColorScience::Transfer::Bt709Oetf;
 };

@@ -467,6 +467,11 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     m_chkFitGamma = new QCheckBox(QStringLiteral("Гамма"), m_cameraPanel);
     m_chkFitSat = new QCheckBox(QStringLiteral("Насыщ."), m_cameraPanel);
     m_chkAutoIris = new QCheckBox(QStringLiteral("+ авто-диафрагма"), m_cameraPanel);
+    m_chkUnlimited = new QCheckBox(QStringLiteral("Без ограничений (тест)"), m_cameraPanel);
+    m_chkUnlimited->setToolTip(QStringLiteral(
+        "Тестовый режим: без ограничения шага за проход и без проверки суммарного ухода от исходных значений — "
+        "поправка отправляется целиком (остаются только допустимые диапазоны камеры). Авто-подгонка применяет "
+        "и предложения с предупреждениями. Снимите галочку для безопасного режима в эфире."));
     for (QCheckBox *box : {m_chkBalance, m_chkExposure, m_chkFitLift, m_chkFitGamma, m_chkFitSat, m_chkAutoIris})
         paramRow->addWidget(box);
     paramRow->addStretch(1);
@@ -494,6 +499,7 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     m_strengthSpin->setPrefix(QStringLiteral("сила "));
     m_strengthSpin->setToolTip(QStringLiteral("Какая доля рассчитанной поправки отправляется"));
     paramRow->addWidget(m_strengthSpin);
+    paramRow->addWidget(m_chkUnlimited);
     paramRow->addStretch(1);
     cameraLayout->addLayout(paramRow);
 
@@ -671,7 +677,8 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     connectMask(m_chkGamma);
     connectMask(m_chkGain);
     connectMask(m_chkLevel);
-    for (QCheckBox *box : {m_chkBalance, m_chkExposure, m_chkFitLift, m_chkFitGamma, m_chkFitSat, m_chkAutoIris})
+    for (QCheckBox *box : {m_chkBalance, m_chkExposure, m_chkFitLift, m_chkFitGamma, m_chkFitSat, m_chkAutoIris,
+                           m_chkUnlimited})
         connect(box, &QCheckBox::toggled, this, [this] { saveEngineSettings(); });
     for (QComboBox *combo : {m_balanceViaCombo, m_exposureViaCombo, m_chartCombo, m_sampleTargetCombo})
         connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] {
@@ -2115,6 +2122,11 @@ QVector<bool> MainWindow::captureActiveMask() const
     return mask;
 }
 
+bool MainWindow::unlimitedMode() const
+{
+    return m_chkUnlimited && m_chkUnlimited->isChecked();
+}
+
 bool MainWindow::modeNeedsReferenceCamera() const
 {
     if (m_tuningMode == ColorMatchMode::ReferenceCamera)
@@ -2162,9 +2174,13 @@ void MainWindow::onAutoMatchLoop()
         box.setIcon(QMessageBox::Question);
         box.setWindowTitle(QStringLiteral("Авто-подгонка"));
         box.setText(QStringLiteral("До %1 раз: захват → расчёт → применение к камерам «В подстройке» → повторный "
-                                   "замер. Шаги ограничены, камеры с подозрительными значениями пропускаются. "
-                                   "«Откат» вернёт значения до начала.")
-                        .arg(m_loopMaxApplies));
+                                   "замер. %2 «Откат» вернёт значения до начала.")
+                        .arg(m_loopMaxApplies)
+                        .arg(unlimitedMode()
+                                 ? QStringLiteral("Режим «Без ограничений»: поправки применяются целиком, "
+                                                  "в том числе с предупреждениями.")
+                                 : QStringLiteral("Шаги ограничены, камеры с подозрительными значениями "
+                                                  "пропускаются.")));
         QPushButton *go = box.addButton(QStringLiteral("Начать"), QMessageBox::AcceptRole);
         box.addButton(QStringLiteral("Отмена"), QMessageBox::RejectRole);
         box.setDefaultButton(go);
@@ -2190,7 +2206,9 @@ void MainWindow::continueAutoMatchLoop()
         if (!c.hasProposal)
             continue;
         worst = std::max(worst, c.deBefore);
-        if (c.warnings.isEmpty() && c.deBefore > 1.0)
+        // test mode: apply even with sanity warnings, only unread camera values block it
+        const bool allowed = unlimitedMode() ? c.currentOk : c.warnings.isEmpty();
+        if (allowed && c.deBefore > 1.0)
             toApply << i;
     }
     const int applied = m_loopPass - 1;
@@ -2360,7 +2378,7 @@ void MainWindow::updateTuningPanelVisibility()
         m_chartCombo->setVisible(checker);
     for (QWidget *w : std::initializer_list<QWidget *>{m_chkBalance, m_chkExposure, m_chkFitLift, m_chkFitGamma,
                                                         m_chkFitSat, m_balanceViaCombo, m_exposureViaCombo,
-                                                        m_strengthSpin})
+                                                        m_strengthSpin, m_chkUnlimited})
         if (w)
             w->setVisible(!camAuto);
     if (m_chkAutoIris)
@@ -2621,7 +2639,7 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
         cam.deBefore = d.deBefore;
         cam.deAfter = d.deAfter;
         cam.warnings = MatchEngine::sanityWarnings(cam.current, cam.proposed);
-        if (cam.hasRollback) {
+        if (cam.hasRollback && !unlimitedMode()) {
             // Several small passes must not add up to a wild change: check the total drift from the
             // values before the first apply as well (the auto loop skips cameras with warnings).
             for (const QString &w : MatchEngine::sanityWarnings(cam.rollback, cam.proposed))
@@ -3078,7 +3096,8 @@ MatchEngine::Settings MainWindow::engineSettings() const
     s.exposureVia = ev == 1 ? MatchEngine::ExposureVia::SensorGain
                             : (ev == 2 ? MatchEngine::ExposureVia::Iris : MatchEngine::ExposureVia::CcGain);
     s.strength = (m_strengthSpin ? m_strengthSpin->value() : 100) / 100.0;
-    s.liveLimits = true; // per-pass limits; the closed loop / repeated capture converges
+    // per-pass limits (the closed loop converges); off in the test mode «Без ограничений»
+    s.liveLimits = !unlimitedMode();
     return s;
 }
 
@@ -3099,6 +3118,7 @@ void MainWindow::loadEngineSettings()
     setBox(m_chkFitGamma, v("gamma", false).toBool());
     setBox(m_chkFitSat, v("saturation", false).toBool());
     setBox(m_chkAutoIris, v("autoIris", false).toBool());
+    setBox(m_chkUnlimited, v("unlimited", true).toBool()); // test period: on by default
     const auto setCombo = [](QComboBox *c, const QVariant &data) {
         if (!c)
             return;
@@ -3138,6 +3158,8 @@ void MainWindow::saveEngineSettings()
         put("saturation", m_chkFitSat->isChecked());
     if (m_chkAutoIris)
         put("autoIris", m_chkAutoIris->isChecked());
+    if (m_chkUnlimited)
+        put("unlimited", m_chkUnlimited->isChecked());
     if (m_balanceViaCombo)
         put("balanceVia", m_balanceViaCombo->currentData());
     if (m_exposureViaCombo)

@@ -299,7 +299,7 @@ Delta solve(const QVector<Pair> &pairsIn, const Settings &st)
             den += p.weight * mag * mag;
         }
         if (chromatic >= 4 && den > 1e-9)
-            d.saturation = std::max(0.6, std::min(1.6, num / den));
+            d.saturation = st.liveLimits ? std::max(0.6, std::min(1.6, num / den)) : std::max(0.05, num / den);
         else
             d.notes << QStringLiteral("насыщенность не считается: мало цветных образцов");
     }
@@ -837,7 +837,7 @@ ReferenceMatch referenceMatch(const SceneStats &cam, const SceneStats &ref, cons
             if (notes)
                 *notes << QStringLiteral("уровень ограничен, чтобы не пересветить светлые участки");
         }
-        if (factor > 2.0 || factor < 0.5) {
+        if (st.liveLimits && (factor > 2.0 || factor < 0.5)) {
             factor = std::clamp(factor, 0.5, 2.0);
             if (notes)
                 *notes << QStringLiteral("уровень ограничен ±1 ступенью за проход");
@@ -868,7 +868,8 @@ ReferenceMatch referenceMatch(const SceneStats &cam, const SceneStats &ref, cons
     }
     // 4) saturation: median chroma ratio, conservative.
     if (st.saturation && cam.medianChroma > 0.01 && ref.medianChroma > 0.01)
-        out.saturation = std::clamp(ref.medianChroma / cam.medianChroma, 0.85, 1.15);
+        out.saturation = st.liveLimits ? std::clamp(ref.medianChroma / cam.medianChroma, 0.85, 1.15)
+                                       : ref.medianChroma / cam.medianChroma; // camera range clamps later
     return out;
 }
 
@@ -899,7 +900,7 @@ QVector<Pair> autoPairs(const QImage &imageIn, const Settings &st, double target
             *notes << QStringLiteral("уровень ограничен, чтобы не пересветить светлые участки");
     }
     // Live-safe step: at most ±1 stop of linear light per pass; repeated passes converge.
-    if (factor > 2.0 || factor < 0.5) {
+    if (st.liveLimits && (factor > 2.0 || factor < 0.5)) {
         factor = std::clamp(factor, 0.5, 2.0);
         if (notes)
             *notes << QStringLiteral("уровень ограничен ±1 ступенью за один проход — повторите захват");

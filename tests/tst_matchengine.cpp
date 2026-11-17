@@ -140,6 +140,7 @@ private Q_SLOTS:
     void signalCheckDarkSceneIsNotBlack();
     void referenceMatchDifferentScenesConverges();
     void liveLimitsBoundOnePass();
+    void unlimitedModeTakesFullStep();
 };
 
 void TestMatchEngine::deltaE2000Reference()
@@ -383,6 +384,7 @@ void TestMatchEngine::autoLimitsExposureStepPerPass()
         }
     MatchEngine::Settings st;
     st.exposure = true;
+    st.liveLimits = true; // safe (non-test) mode
     QStringList notes;
     const QVector<Pair> pairs = MatchEngine::autoPairs(img, st, 41.0, nullptr, &notes);
     QVERIFY(!pairs.isEmpty());
@@ -499,6 +501,38 @@ void TestMatchEngine::liveLimitsBoundOnePass()
     const CameraCorrectionBundle out = MatchEngine::compose(CameraCorrectionBundle(), d, st);
     QVERIFY(MatchEngine::sanityWarnings(CameraCorrectionBundle(), out).isEmpty());
     QVERIFY(!d.notes.isEmpty());
+}
+
+void TestMatchEngine::unlimitedModeTakesFullStep()
+{
+    // Camera 3 stops darker than the reference, saturation half: with limits one pass is capped
+    // (±1 stop, ±15 % saturation); without limits («Без ограничений (тест)») the full change is proposed.
+    MatchEngine::SceneStats cam, ref;
+    cam.valid = ref.valid = true;
+    cam.p25Linear = 0.005; cam.p50Linear = 0.01; cam.p75Linear = 0.02; cam.p90Linear = 0.03; cam.p98Linear = 0.05;
+    cam.keyLinear = 0.01;
+    ref.p25Linear = 0.04; ref.p50Linear = 0.08; ref.p75Linear = 0.16; ref.p90Linear = 0.24; ref.p98Linear = 0.4;
+    ref.keyLinear = 0.08;
+    cam.medianChroma = 0.05;
+    ref.medianChroma = 0.10;
+    MatchEngine::Settings st;
+    st.saturation = true;
+    const auto levelOf = [](const MatchEngine::Settings &s, const MatchEngine::ReferenceMatch &rm) {
+        MatchEngine::Settings s2 = s;
+        s2.saturation = false;
+        const MatchEngine::Delta d = MatchEngine::solve(rm.pairs, s2);
+        return 0.2126 * d.ch[0].gain + 0.7152 * d.ch[1].gain + 0.0722 * d.ch[2].gain;
+    };
+    st.liveLimits = true;
+    const MatchEngine::ReferenceMatch limited = MatchEngine::referenceMatch(cam, ref, st);
+    st.liveLimits = false;
+    const MatchEngine::ReferenceMatch full = MatchEngine::referenceMatch(cam, ref, st);
+    const double lvLimited = levelOf(MatchEngine::Settings{}, limited);
+    const double lvFull = levelOf(MatchEngine::Settings{}, full);
+    qInfo() << "level limited/full" << lvLimited << lvFull << "sat" << limited.saturation << full.saturation;
+    QVERIFY(lvFull > lvLimited * 1.5);
+    QCOMPARE(limited.saturation, 1.15);
+    QVERIFY(std::fabs(full.saturation - 2.0) < 1e-9);
 }
 
 QTEST_MAIN(TestMatchEngine)

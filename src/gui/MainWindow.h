@@ -154,6 +154,7 @@ private:
     void readCurrentCameraValues();
     /** Cameras that take part in this capture: «В подстройке» + the reference camera when the mode needs it. */
     QVector<bool> captureActiveMask() const;
+    bool unlimitedMode() const;
     bool modeNeedsReferenceCamera() const;
     int sendProposals(const QVector<int> &indices, QString *errors);
     void onAutoMatchLoop();
@@ -246,6 +247,7 @@ private:
     class QCheckBox *m_chkFitGamma = nullptr;
     class QCheckBox *m_chkFitSat = nullptr;
     class QCheckBox *m_chkAutoIris = nullptr;
+    class QCheckBox *m_chkUnlimited = nullptr; ///< «Без ограничений (тест)»: no per-pass / cumulative limits
     QComboBox *m_balanceViaCombo = nullptr;
     QComboBox *m_exposureViaCombo = nullptr;
     QComboBox *m_chartCombo = nullptr;
