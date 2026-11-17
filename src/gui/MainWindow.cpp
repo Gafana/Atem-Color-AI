@@ -302,10 +302,6 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
         if (m_scopeDocks)
             m_scopeDocks->applyLayoutPreset(QStringLiteral("camera_match"));
     });
-    toolbar->addAction(QStringLiteral("Кадрирование"), this, [this] {
-        if (m_previewOverlay)
-            m_previewOverlay->setTool(PreviewOverlayWidget::Tool::GrayRect);
-    });
     toolbar->addAction(QStringLiteral("Снимок (S)"), this, &MainWindow::onTakeSnapshot);
     toolbar->addAction(QStringLiteral("Наложение снимка"), this, [this] {
         if (m_scopeDocks)
@@ -453,6 +449,21 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     m_markCameraCombo = new QComboBox(m_cameraPanel);
     m_markCameraCombo->setToolTip(QStringLiteral("Камера выводится на AUX, область рисуется мышкой на превью"));
     markRow->addWidget(m_markCameraCombo, 1);
+    m_btnClearZone = new QPushButton(QStringLiteral("Сбросить область"), m_cameraPanel);
+    m_btnClearZone->setToolTip(QStringLiteral("Убрать область этой камеры — замер по всему кадру "
+                                              "(правый клик на превью делает то же)"));
+    connect(m_btnClearZone, &QPushButton::clicked, this, [this] {
+        if (!m_previewOverlay)
+            return;
+        if (m_tuningMode == ColorMatchMode::ColorChecker) {
+            m_previewOverlay->setCheckerCorners({});
+            onCheckerRoiEdited({});
+        } else {
+            m_previewOverlay->setGrayRoi({});
+            onGrayRoiEdited({});
+        }
+    });
+    markRow->addWidget(m_btnClearZone);
     m_btnSaveRef = new QPushButton(QStringLiteral("Сохранить эталон"), m_cameraPanel);
     m_btnLoadRef = new QPushButton(QStringLiteral("Загрузить эталон…"), m_cameraPanel);
     markRow->addWidget(m_btnSaveRef);
@@ -2424,9 +2435,13 @@ void MainWindow::updateTuningPanelVisibility()
     if (m_modeHint)
         m_modeHint->setText(colorMatchModeHint(m));
     if (m_previewOverlay) {
-        m_previewOverlay->setTool(checker ? PreviewOverlayWidget::Tool::ColorCheckerQuad
-                                          : PreviewOverlayWidget::Tool::GrayRect);
+        // whole-frame modes: no zone on the preview and no accidental drawing with the mouse
+        m_previewOverlay->setTool(checker   ? PreviewOverlayWidget::Tool::ColorCheckerQuad
+                                  : marking ? PreviewOverlayWidget::Tool::GrayRect
+                                            : PreviewOverlayWidget::Tool::None);
     }
+    if (m_btnClearZone)
+        m_btnClearZone->setVisible(marking);
     applyOverlayForMarkCamera();
 }
 
@@ -2645,8 +2660,12 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
         c.notes.clear();
         c.warnings.clear();
     }
+    // A marked zone is used only by the modes that let you mark one; the others measure the whole frame
+    // (a zone left over from another mode must not silently crop the picture).
+    const bool zoneMode = m_tuningMode == ColorMatchMode::ReferenceCamera || m_tuningMode == ColorMatchMode::GrayCard
+                          || m_tuningMode == ColorMatchMode::CommonSample;
     const auto roiAnalysis = [&](const CameraRow &cam) -> FrameColorAnalysis {
-        if (!cam.grayRoi.isEmpty() && !cam.lastFrame.isNull())
+        if (zoneMode && !cam.grayRoi.isEmpty() && !cam.lastFrame.isNull())
             return analyzeNormalizedRoi(cam.lastFrame, cam.grayRoi);
         return cam.analysis;
     };
@@ -2812,7 +2831,7 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
         // Reference camera / frame: robust scene statistics (light colour, median level, percentiles)
         // instead of comparing whole-frame histograms of different scenes.
         const auto roiImage = [&](const CameraRow &c) {
-            const QRect r = roiRect(c.lastFrame, c.grayRoi);
+            const QRect r = zoneMode ? roiRect(c.lastFrame, c.grayRoi) : QRect();
             return r.isEmpty() ? c.lastFrame : c.lastFrame.copy(r);
         };
         MatchEngine::SceneStats refStats;

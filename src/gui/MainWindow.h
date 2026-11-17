@@ -265,6 +265,7 @@ private:
     QLabel *m_modeHint = nullptr;
     QLabel *m_refLabel = nullptr;
     QLabel *m_markLabel = nullptr;
+    QPushButton *m_btnClearZone = nullptr;
     class QMenu *m_presetMenu = nullptr;
     bool m_atemWasConnected = false;
 
