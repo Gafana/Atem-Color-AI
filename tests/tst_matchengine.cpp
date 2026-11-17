@@ -10,6 +10,7 @@
 #include <QPainter>
 #include <QtTest>
 
+#include <algorithm>
 #include <cmath>
 
 using namespace ColorScience;
@@ -53,6 +54,20 @@ struct SimCamera
         const MatchEngine::ChannelCurve cg{state.gainG, state.liftG, state.gammaG};
         const MatchEngine::ChannelCurve cb{state.gainB, state.liftB, state.gammaB};
         Rgb y{cr.apply(e.r), cg.apply(e.g), cb.apply(e.b)};
+        // Luma Mix 100 %: R/G/B corrections keep the luminance; the Y curve sets the level/tone
+        // (matches the real Micro Studio Camera 4K G2 behaviour measured live).
+        const double l0 = luma(e);
+        const double l1 = luma(y);
+        if (l1 > 1e-6) {
+            const double k = (state.lumaMix * l0 + (1.0 - state.lumaMix) * l1) / l1;
+            y = {y.r * k, y.g * k, y.b * k};
+        }
+        const MatchEngine::ChannelCurve cy{state.gainY, state.liftY, state.gammaY};
+        const double ly = luma(y);
+        if (ly > 1e-6) {
+            const double k = cy.apply(ly) / ly;
+            y = {y.r * k, y.g * k, y.b * k};
+        }
         const double l = luma(y);
         y = {l + state.saturation * (y.r - l), l + state.saturation * (y.g - l), l + state.saturation * (y.b - l)};
         for (int c = 0; c < 3; ++c)
@@ -122,6 +137,9 @@ private Q_SLOTS:
     void autoRejectsBlackFrame();
     void autoLimitsColouredStageLight();
     void autoLimitsExposureStepPerPass();
+    void signalCheckDarkSceneIsNotBlack();
+    void referenceMatchDifferentScenesConverges();
+    void liveLimitsBoundOnePass();
 };
 
 void TestMatchEngine::deltaE2000Reference()
@@ -369,10 +387,118 @@ void TestMatchEngine::autoLimitsExposureStepPerPass()
     const QVector<Pair> pairs = MatchEngine::autoPairs(img, st, 41.0, nullptr, &notes);
     QVERIFY(!pairs.isEmpty());
     const CameraCorrectionBundle out = MatchEngine::compose(CameraCorrectionBundle(), MatchEngine::solve(pairs, st), st);
-    qInfo() << "dark-scene gains" << out.gainR << out.gainG << out.gainB << notes;
+    qInfo() << "dark-scene gains RGB/Y" << out.gainR << out.gainG << out.gainB << out.gainY << notes;
+    // level goes to the luma (Y) gain; R/G/B stay neutral for a neutral scene
+    QVERIFY2(out.gainY > 1.0f && out.gainY < 2.05f, qPrintable(QStringLiteral("gain Y %1").arg(out.gainY)));
     for (float g : {out.gainR, out.gainG, out.gainB})
-        QVERIFY2(g > 1.0f && g < 2.05f, qPrintable(QStringLiteral("gain %1").arg(g)));
+        QVERIFY2(std::fabs(g - 1.0f) < 0.02f, qPrintable(QStringLiteral("gain %1").arg(g)));
     QVERIFY(notes.join(' ').contains(QStringLiteral("±1 ступенью")));
+}
+
+void TestMatchEngine::signalCheckDarkSceneIsNotBlack()
+{
+    // Dim room: mean ~4 % code, but texture and sensor noise -> real picture, low light.
+    QImage dark(640, 360, QImage::Format_RGB32);
+    quint32 seed = 12345;
+    for (int y = 0; y < dark.height(); ++y)
+        for (int x = 0; x < dark.width(); ++x) {
+            seed = seed * 1103515245u + 12345u;
+            const int noise = static_cast<int>((seed >> 16) % 5) - 2;
+            const int base = 6 + ((x / 64 + y / 48) % 3) * 4 + (x > 400 && y < 120 ? 30 : 0);
+            const int v = std::clamp(base + noise, 0, 255);
+            dark.setPixel(x, y, qRgb(v, v, std::max(0, v - 1)));
+        }
+    const MatchEngine::SignalCheck d = MatchEngine::checkSignal(dark);
+    QVERIFY2(!d.noSignal, qPrintable(d.reason));
+    QVERIFY(d.lowLight);
+
+    QImage flat(640, 360, QImage::Format_RGB32);
+    flat.fill(qRgb(16, 16, 16));
+    QVERIFY(MatchEngine::checkSignal(flat).noSignal);
+    QImage black(640, 360, QImage::Format_RGB32);
+    black.fill(qRgb(0, 0, 0));
+    QVERIFY(MatchEngine::checkSignal(black).noSignal);
+
+    // The dark scene must still give a (limited) auto correction instead of "no signal".
+    QStringList notes;
+    MatchEngine::Settings st;
+    const QVector<Pair> pairs = MatchEngine::autoPairs(dark, st, 41.0, nullptr, &notes);
+    QVERIFY2(!pairs.isEmpty(), qPrintable(notes.join(QStringLiteral("; "))));
+}
+
+void TestMatchEngine::referenceMatchDifferentScenesConverges()
+{
+    // Reference camera and the camera to match look at DIFFERENT parts of the set (different patch
+    // subsets and layout); the light is the same. Matching must converge on the light / level.
+    const Scene full = chartScene();
+    Scene a, b;
+    for (int i = 0; i < 24; ++i) {
+        const Rgb p = full.patchesLinear[i];
+        if (i < 12 || full.neutral.contains(i)) {
+            if (full.neutral.contains(i))
+                a.neutral << a.patchesLinear.size();
+            a.patchesLinear << p;
+        }
+    }
+    for (int i = 23; i >= 0; --i) {
+        const Rgb p = full.patchesLinear[i];
+        if (i >= 6 || full.neutral.contains(i)) {
+            if (full.neutral.contains(i))
+                b.neutral << b.patchesLinear.size();
+            b.patchesLinear << p;
+        }
+    }
+    while (a.patchesLinear.size() < 24)
+        a.patchesLinear << a.patchesLinear[a.patchesLinear.size() % 12];
+    while (b.patchesLinear.size() < 24)
+        b.patchesLinear << b.patchesLinear[b.patchesLinear.size() % 12];
+
+    SimCamera ref;
+    ref.lightKelvin = 4800;
+    SimCamera cam;
+    cam.lightKelvin = 4800;
+    cam.exposureStops = -0.8;
+    cam.state.gainR = 1.18f;
+    cam.state.gainB = 0.86f;
+
+    MatchEngine::Settings st;
+    st.liveLimits = true;
+    const Rgb grey = full.patchesLinear[full.neutral.value(2)];
+    const auto greyDe = [&] {
+        return deltaE2000(linear709ToLabD65(decode(cam.shoot(grey), Transfer::Bt709Oetf)),
+                          linear709ToLabD65(decode(ref.shoot(grey), Transfer::Bt709Oetf)));
+    };
+    const double de0 = greyDe();
+    QStringList log;
+    const MatchEngine::SceneStats rs = MatchEngine::sceneStats(ref.render(a), st.transfer);
+    for (int pass = 0; pass < 4; ++pass) {
+        const MatchEngine::SceneStats cs = MatchEngine::sceneStats(cam.render(b), st.transfer);
+        const MatchEngine::ReferenceMatch m = MatchEngine::referenceMatch(cs, rs, st);
+        QVERIFY(!m.pairs.isEmpty());
+        const MatchEngine::Delta d = MatchEngine::solve(m.pairs, st);
+        cam.state = MatchEngine::compose(cam.state, d, st);
+        log << QString::number(greyDe(), 'f', 2);
+    }
+    const double de1 = greyDe();
+    qInfo() << "reference match grey dE" << de0 << "->" << log;
+    QVERIFY2(de1 < 2.5 && de1 < de0 * 0.3, qPrintable(QStringLiteral("%1 -> %2").arg(de0).arg(de1)));
+}
+
+void TestMatchEngine::liveLimitsBoundOnePass()
+{
+    QVector<Pair> pairs;
+    Pair p;
+    p.measured = {0.2, 0.4, 0.6};
+    p.target = {0.45, 0.4, 0.2};
+    p.neutral = true;
+    pairs << p;
+    MatchEngine::Settings st;
+    st.liveLimits = true;
+    st.lift = true;
+    const MatchEngine::Delta d = MatchEngine::solve(pairs, st);
+    const CameraCorrectionBundle out = MatchEngine::compose(CameraCorrectionBundle(), d, st);
+    QVERIFY(MatchEngine::sanityWarnings(CameraCorrectionBundle(), out).isEmpty());
+    QVERIFY(!d.notes.isEmpty());
 }
 
 QTEST_MAIN(TestMatchEngine)

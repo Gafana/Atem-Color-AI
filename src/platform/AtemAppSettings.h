@@ -17,6 +17,7 @@ struct CameraBinding
     QString label;
     qint64 atemId = 0;
     int multiviewWindow = 0;
+    bool includeInTuning = true; ///< «В подстройке» (persisted)
 };
 
 namespace AtemAppSettings {

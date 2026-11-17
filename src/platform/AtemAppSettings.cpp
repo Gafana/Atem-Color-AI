@@ -250,6 +250,7 @@ QVector<CameraBinding> cameraMap()
         row.label = object.value(QStringLiteral("label")).toString();
         row.atemId = static_cast<qint64>(object.value(QStringLiteral("atemId")).toDouble());
         row.multiviewWindow = object.value(QStringLiteral("window")).toInt();
+        row.includeInTuning = object.value(QStringLiteral("tune")).toBool(true);
         if (row.label.isEmpty())
             row.label = QStringLiteral("Камера %1").arg(row.atemId);
         rows.push_back(row);
@@ -265,6 +266,7 @@ void setCameraMap(const QVector<CameraBinding> &rows)
         object.insert(QStringLiteral("label"), row.label);
         object.insert(QStringLiteral("atemId"), static_cast<double>(row.atemId));
         object.insert(QStringLiteral("window"), row.multiviewWindow);
+        object.insert(QStringLiteral("tune"), row.includeInTuning);
         array.append(object);
     }
     setGroupValue("mapping", "cameras", QString::fromUtf8(QJsonDocument(array).toJson(QJsonDocument::Compact)));

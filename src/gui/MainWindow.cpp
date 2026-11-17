@@ -53,6 +53,8 @@
 #include <QMetaObject>
 #include <QThread>
 #include <QHeaderView>
+#include <QFontMetrics>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -349,9 +351,11 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     deviceRow->addWidget(m_deviceCombo, 2);
     deviceRow->addWidget(new QLabel(QStringLiteral("Вход:"), m_sourcePanel));
     m_inputCombo = new QComboBox(m_sourcePanel);
+    m_inputCombo->setMinimumWidth(110);
     deviceRow->addWidget(m_inputCombo, 1);
     deviceRow->addWidget(new QLabel(QStringLiteral("Режим:"), m_sourcePanel));
     m_modeCombo = new QComboBox(m_sourcePanel);
+    m_modeCombo->setMinimumWidth(170);
     deviceRow->addWidget(m_modeCombo, 1);
     auto *btnRefresh = new QPushButton(QStringLiteral("Обновить"), m_sourcePanel);
     deviceRow->addWidget(btnRefresh);
@@ -513,11 +517,53 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     m_corrTable->setHorizontalHeaderLabels({QStringLiteral("Камера"), QStringLiteral("Ошибка, IRE"),
                                             QStringLiteral("ΔE2000"), QStringLiteral("Что изменится"),
                                             QStringLiteral("Внимание")});
-    m_corrTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    // Long texts: every column can be resized by the user, text wraps, the full text is in the tooltip.
+    m_corrTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
     m_corrTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    m_corrTable->horizontalHeader()->setStretchLastSection(false);
+    m_corrTable->horizontalHeader()->setMinimumSectionSize(50);
+    m_corrTable->setColumnWidth(0, 60);
+    m_corrTable->setColumnWidth(1, 80);
+    m_corrTable->setColumnWidth(2, 130);
+    m_corrTable->setColumnWidth(4, 170);
+    m_corrTable->setWordWrap(true);
+    m_corrTable->setTextElideMode(Qt::ElideNone);
+    m_corrTable->verticalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    m_corrTable->verticalHeader()->setVisible(false);
     m_corrTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    connect(m_corrTable->horizontalHeader(), &QHeaderView::sectionResized, m_corrTable,
+            [this] { m_corrTable->resizeRowsToContents(); });
     m_corrTable->setMinimumHeight(90);
+    m_corrTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_corrTable->setSelectionMode(QAbstractItemView::SingleSelection);
     cameraLayout->addWidget(m_corrTable, 1);
+    // Full text of the selected row (nothing is cut off, even in a narrow panel).
+    m_corrDetails = new QLabel(m_cameraPanel);
+    m_corrDetails->setWordWrap(true);
+    m_corrDetails->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_corrDetails->setStyleSheet(QStringLiteral("QLabel { background: #23262b; border: 1px solid #3a3f46; padding: 4px; }"));
+    m_corrDetails->setVisible(false);
+    cameraLayout->addWidget(m_corrDetails);
+    connect(m_corrTable, &QTableWidget::currentCellChanged, this, [this](int row, int, int, int) {
+        if (!m_corrDetails)
+            return;
+        if (row < 0 || !m_corrTable->item(row, 0)) {
+            m_corrDetails->setVisible(false);
+            return;
+        }
+        QStringList lines;
+        lines << QStringLiteral("<b>%1</b>").arg(m_corrTable->item(row, 0)->text().toHtmlEscaped());
+        const QStringList heads = {QString(), QStringLiteral("Ошибка, IRE"), QStringLiteral("ΔE2000"),
+                                   QStringLiteral("Что изменится"), QStringLiteral("Внимание")};
+        for (int c = 1; c < 5; ++c) {
+            const QTableWidgetItem *it = m_corrTable->item(row, c);
+            if (it && !it->text().isEmpty() && it->text() != QStringLiteral("—"))
+                lines << QStringLiteral("<b>%1:</b> %2").arg(heads.at(c), it->text().toHtmlEscaped().replace(
+                                                                               QLatin1Char('\n'), QStringLiteral("<br>")));
+        }
+        m_corrDetails->setText(lines.join(QStringLiteral("<br>")));
+        m_corrDetails->setVisible(true);
+    });
 
     auto *buttons = new QHBoxLayout();
     m_btnCapture = new QPushButton(QStringLiteral("1. Захват и расчёт"), m_cameraPanel);
@@ -525,8 +571,13 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     m_btnRollback = new QPushButton(QStringLiteral("Откат"), m_cameraPanel);
     m_btnCapture->setToolTip(QStringLiteral("AUX по очереди переключается на камеры, кадры усредняются ~0,75 с"));
     m_btnApply->setToolTip(QStringLiteral("Выбор камер, проверка значений и отправка на пульт"));
+    m_btnLoop = new QPushButton(QStringLiteral("Авто-подгонка (3 прохода)"), m_cameraPanel);
+    m_btnLoop->setToolTip(QStringLiteral(
+        "Замкнутый цикл: захват → расчёт → применение → пауза ~0,8 с → повторный замер, до 3 применений. "
+        "Каждый шаг ограничен, ΔE показывается по проходам. «Откат» вернёт значения до начала."));
     buttons->addWidget(m_btnCapture);
     buttons->addWidget(m_btnApply);
+    buttons->addWidget(m_btnLoop);
     buttons->addWidget(m_btnRollback);
     cameraLayout->addLayout(buttons);
 
@@ -582,6 +633,7 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     connect(m_mapTable, &QTableWidget::itemChanged, this, &MainWindow::onMappingEdited);
     connect(m_btnCapture, &QPushButton::clicked, this, &MainWindow::onCaptureAnalyze);
     connect(m_btnApply, &QPushButton::clicked, this, &MainWindow::onApply);
+    connect(m_btnLoop, &QPushButton::clicked, this, &MainWindow::onAutoMatchLoop);
     connect(m_btnRollback, &QPushButton::clicked, this, [this] {
         if (!m_client || m_busy)
             return;
@@ -589,9 +641,14 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
         for (CameraRow &camera : m_cameras) {
             if (!camera.hasRollback)
                 continue;
-            m_client->rollbackCorrection(camera.binding.atemId, camera.rollback);
+            const QString err = m_client->rollbackCorrection(camera.binding.atemId, camera.rollback);
+            qCInfo(lcRoute).noquote() << QStringLiteral("rollback %1 %2 %3")
+                                             .arg(camera.binding.label, err.isEmpty() ? QStringLiteral("ok") : err,
+                                                  QString::fromUtf8(QJsonDocument(camera.rollback.toJson())
+                                                                        .toJson(QJsonDocument::Compact)));
             camera.hasRollback = false;
         }
+        statusBar()->showMessage(QStringLiteral("Откат выполнен"), 8000);
         QMessageBox::information(this, QString(), QStringLiteral("Откат выполнен"));
     });
     connect(m_referenceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
@@ -680,6 +737,8 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     loadCameraRois();
     rebuildAtemAvailabilityUi();
 
+    for (QComboBox *combo : findChildren<QComboBox *>())
+        fitComboPopup(combo);
     QTimer::singleShot(0, this, [this] { connectAtem(false); });
     // Link watchdog: the SDK reports "disconnected" asynchronously (cable / power loss).
     auto *linkTimer = new QTimer(this);
@@ -853,6 +912,7 @@ void MainWindow::refreshAuxList()
         if (m_auxes.at(i).id == saved)
             found = i;
     }
+    fitComboPopup(m_auxCombo);
     if (found >= 0)
         m_auxCombo->setCurrentIndex(found);
     else
@@ -1019,6 +1079,7 @@ void MainWindow::addMapRow(const CameraBinding &binding)
 
     auto *combo = new QComboBox(m_mapTable);
     fillInputCombo(combo, binding.atemId);
+    fitComboPopup(combo);
     m_mapTable->setCellWidget(row, 1, combo);
     connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             &MainWindow::onMappingEdited);
@@ -1032,8 +1093,11 @@ void MainWindow::addMapRow(const CameraBinding &binding)
 
     auto *participate = new QTableWidgetItem();
     participate->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled);
-    participate->setCheckState(Qt::Checked);
+    participate->setCheckState(binding.includeInTuning ? Qt::Checked : Qt::Unchecked);
+    participate->setToolTip(QStringLiteral("Только отмеченные камеры захватываются, рассчитываются и получают поправки"));
+    m_loading = true;
     m_mapTable->setItem(row, 3, participate);
+    m_loading = false;
 }
 
 CameraBinding MainWindow::bindingFromRow(int row) const
@@ -1049,12 +1113,16 @@ CameraBinding MainWindow::bindingFromRow(int row) const
         binding.atemId = combo->currentData().toLongLong();
     if (auto *spin = qobject_cast<QSpinBox *>(m_mapTable->cellWidget(row, 2)))
         binding.multiviewWindow = spin->value();
+    if (const QTableWidgetItem *tune = m_mapTable->item(row, 3))
+        binding.includeInTuning = tune->checkState() == Qt::Checked;
     return binding;
 }
 
 void MainWindow::saveMapping()
 {
-    if (m_loading || !m_mapTable)
+    // Before the saved mapping is loaded the table is empty: saving then would wipe the camera list
+    // (and the «В подстройке» marks) on every start.
+    if (m_loading || !m_mapTable || !m_mappingLoaded)
         return;
     QVector<CameraBinding> rows;
     rows.reserve(m_mapTable->rowCount());
@@ -1072,6 +1140,7 @@ void MainWindow::loadMappingFromSettings()
     m_loading = false;
     for (const CameraBinding &row : rows)
         addMapRow(row);
+    m_mappingLoaded = true;
 }
 
 void MainWindow::seedMappingFromInputs()
@@ -1253,6 +1322,7 @@ void MainWindow::applyDeviceList()
     m_deviceCombo->clear();
     for (const VideoDevice &device : m_devices)
         m_deviceCombo->addItem(device.displayName, device.id);
+    fitComboPopup(m_deviceCombo);
 
     const QString saved = AtemAppSettings::videoDeviceId();
     const int found = saved.isEmpty() ? -1 : m_deviceCombo->findData(saved);
@@ -1304,6 +1374,7 @@ void MainWindow::populateDeviceOptions()
         for (const VideoInputOption &input : device.inputs)
             m_inputCombo->addItem(input.label, input.key);
         m_inputCombo->setEnabled(!device.inputs.isEmpty());
+        fitComboPopup(m_inputCombo);
         if (!selectComboKey(m_inputCombo, savedInput, !sameDevice || savedInput.isEmpty())) {
             if (m_videoStatus) {
                 m_videoStatus->setText(QStringLiteral(
@@ -1322,6 +1393,7 @@ void MainWindow::populateDeviceOptions()
         for (const VideoModeOption &mode : device.modes)
             m_modeCombo->addItem(mode.label, mode.key);
         m_modeCombo->setEnabled(!device.modes.isEmpty());
+        fitComboPopup(m_modeCombo);
         if (!selectComboKey(m_modeCombo, savedMode, !sameDevice || savedMode.isEmpty())) {
             if (m_videoStatus) {
                 m_videoStatus->setText(QStringLiteral(
@@ -1451,8 +1523,18 @@ void MainWindow::onPreviewError(const QString &message)
     const int delayMs = qMin(10000, 2000 * ++m_previewRetry);
     m_previewRetryAtMs = m_closing.load() ? 0 : QDateTime::currentMSecsSinceEpoch() + delayMs;
     qCWarning(lcRoute).noquote() << "preview error:" << message << "- retry in" << delayMs << "ms";
+    QString hint;
+    const QString device = m_deviceCombo ? m_deviceCombo->currentText() : QString();
+    if (device.contains(QLatin1String("decklink"), Qt::CaseInsensitive)
+        && (message.contains(QLatin1String("Internal data stream error"), Qt::CaseInsensitive)
+            || message.contains(QLatin1String("negotiat"), Qt::CaseInsensitive))) {
+        // DeckLink does not adapt to the input: frames arrive only in the exact input format.
+        hint = QStringLiteral("\nВыбранный режим «%1» не совпадает с сигналом на входе карты. "
+                              "Выберите режим как у источника (у ATEM обычно 1920×1080 @ 25 или 50 кадр/с).")
+                   .arg(m_modeCombo ? m_modeCombo->currentText() : QString());
+    }
     if (m_videoStatus)
-        m_videoStatus->setText(QStringLiteral("%1 — повторный запуск через %2 с").arg(message).arg(delayMs / 1000));
+        m_videoStatus->setText(QStringLiteral("%1 — повторный запуск через %2 с%3").arg(message).arg(delayMs / 1000).arg(hint));
     if (m_fpsLabel)
         m_fpsLabel->setText(QStringLiteral("Превью: нет кадров"));
 }
@@ -1464,6 +1546,8 @@ void MainWindow::setBusy(bool busy)
         m_btnCapture->setEnabled(!busy);
     if (m_btnRollback)
         m_btnRollback->setEnabled(!busy);
+    if (m_btnLoop)
+        m_btnLoop->setEnabled(!busy);
     if (m_btnConnect)
         m_btnConnect->setEnabled(!busy);
     if (m_mapTable)
@@ -1572,6 +1656,13 @@ void MainWindow::onCaptureAnalyze()
     job->request.referenceIndex = m_referenceIndex;
     for (const CameraRow &camera : m_cameras)
         job->request.cameras.push_back(camera.binding);
+    job->request.active = captureActiveMask();
+    if (!job->request.active.contains(true)) {
+        delete job;
+        QMessageBox::warning(this, QStringLiteral("Захват"),
+                             QStringLiteral("Отметьте камеры в столбце «В подстройке»."));
+        return;
+    }
     m_captureJob = job;
     connect(job, &QThread::finished, this, [this, job] { finishCapture(job); });
     setBusy(true);
@@ -1619,9 +1710,13 @@ void MainWindow::executeCapture(const CaptureRequest &request, const std::atomic
         return;
     }
 
+    const auto isActive = [&](int i) { return request.active.isEmpty() || request.active.value(i, false); };
+    const int activeTotal = request.active.isEmpty() ? static_cast<int>(request.cameras.size())
+                                                     : static_cast<int>(request.active.count(true));
+    int activeDone = 0;
     qCInfo(lcRoute).noquote() << QStringLiteral("capture route=%1 cameras=%2 aux=%3 layout=%4")
                                      .arg(request.route)
-                                     .arg(request.cameras.size())
+                                     .arg(activeTotal)
                                      .arg(request.auxId)
                                      .arg(request.layout);
 
@@ -1653,6 +1748,8 @@ void MainWindow::executeCapture(const CaptureRequest &request, const std::atomic
                 outcome->fatal = QStringLiteral("Захват прерван");
                 return;
             }
+            if (!isActive(i))
+                continue;
             const CameraBinding &camera = request.cameras.at(i);
             status(QStringLiteral("Multiview: %1, окно %2")
                        .arg(camera.label)
@@ -1709,8 +1806,10 @@ void MainWindow::executeCapture(const CaptureRequest &request, const std::atomic
                 outcome->fatal = QStringLiteral("Захват прерван");
                 return;
             }
+            if (!isActive(i))
+                continue; // not «В подстройке»: the AUX is not switched to it at all
             const CameraBinding &camera = request.cameras.at(i);
-            status(QStringLiteral("AUX: %1 (%2/%3)").arg(camera.label).arg(i + 1).arg(request.cameras.size()));
+            status(QStringLiteral("AUX: %1 (%2/%3)").arg(camera.label).arg(++activeDone).arg(activeTotal));
             const QString setError = callOnGuiThread([&] {
                 return m_client ? m_client->setAuxSource(request.auxId, camera.atemId)
                                 : QStringLiteral("Нет клиента ATEM");
@@ -1744,6 +1843,8 @@ void MainWindow::executeCapture(const CaptureRequest &request, const std::atomic
                 outcome->fatal = QStringLiteral("Захват прерван");
                 return;
             }
+            if (!isActive(i))
+                continue;
             const CameraBinding &camera = request.cameras.at(i);
             status(QStringLiteral("PGM: %1").arg(camera.label));
             qint64 previous = 0;
@@ -1818,10 +1919,20 @@ void MainWindow::finishCapture(CaptureJob *job)
 
     setBusy(false);
     if (!outcome.fatal.isEmpty()) {
+        if (m_loopPass > 0)
+            finishAutoMatchLoop(outcome.fatal);
         QMessageBox::warning(this, QStringLiteral("Захват"), outcome.fatal);
         return;
     }
 
+    const QVector<bool> active = job ? job->request.active : QVector<bool>();
+    for (int i = 0; i < m_cameras.size(); ++i) {
+        if (!active.isEmpty() && !active.value(i, false)) {
+            // not captured this time: stale frames must not produce proposals
+            m_cameras[i].analysis = FrameColorAnalysis();
+            m_cameras[i].lastFrame = QImage();
+        }
+    }
     for (int i = 0; i < outcome.analysis.size() && i < m_cameras.size(); ++i) {
         if (!outcome.errors.value(i).isEmpty())
             continue;
@@ -1859,7 +1970,7 @@ void MainWindow::onApply()
 
     QVector<int> candidates;
     for (int i = 0; i < m_cameras.size(); ++i)
-        if (camAuto || m_cameras.at(i).hasProposal)
+        if ((camAuto && m_cameras.at(i).includeInTuning) || (!camAuto && m_cameras.at(i).hasProposal))
             candidates << i;
     if (candidates.isEmpty()) {
         QMessageBox::information(this, QStringLiteral("Поправки"),
@@ -1877,7 +1988,7 @@ void MainWindow::onApply()
         const CameraRow &c = m_cameras.at(i);
         QString text = c.binding.label;
         if (!camAuto) {
-            text += QStringLiteral(":  ") + summarizeChange(c.current, c.proposed);
+            text += QStringLiteral(":  ") + summarizeChange(c.current, c.proposed).replace(QLatin1Char('\n'), QStringLiteral(", "));
             if (!c.warnings.isEmpty()) {
                 text += QStringLiteral("\n   ⚠ ") + c.warnings.join(QStringLiteral("; "));
                 anyWarning = true;
@@ -1932,13 +2043,27 @@ void MainWindow::onApply()
         return;
 
     QString errors;
+    const int sent = sendProposals(chosen, &errors);
+    refreshCorrectionsTable();
+    if (!errors.isEmpty())
+        QMessageBox::warning(this, QStringLiteral("Частичные ошибки"), errors);
+    setCaptureStatus(QStringLiteral("Отправлено на %1 камер(ы). Для уточнения повторите «Захват и расчёт».").arg(sent));
+    statusBar()->showMessage(QStringLiteral("Поправки отправлены: %1").arg(sent), 8000);
+}
+
+int MainWindow::sendProposals(const QVector<int> &chosen, QString *errorsOut)
+{
+    const bool camAuto = m_tuningMode == ColorMatchMode::CameraAuto;
+    QString errors;
     int sent = 0;
     for (int index : chosen) {
+        if (index < 0 || index >= m_cameras.size())
+            continue;
         CameraRow &camera = m_cameras[index];
         if (camAuto) {
             // Keep the values before auto WB so "Откат" can restore them.
             CameraCorrectionBundle before;
-            if (m_client->readCorrectionBundle(camera.binding.atemId, before).isEmpty()) {
+            if (!camera.hasRollback && m_client->readCorrectionBundle(camera.binding.atemId, before).isEmpty()) {
                 camera.rollback = before;
                 camera.hasRollback = true;
             }
@@ -1962,17 +2087,164 @@ void MainWindow::onApply()
         if (!error.isEmpty()) {
             errors += QStringLiteral("%1: %2\n").arg(camera.binding.label, error);
         } else {
-            camera.rollback = previous;
-            camera.hasRollback = true;
+            // «Откат» returns to the values before the FIRST apply (not just the last pass).
+            if (!camera.hasRollback) {
+                camera.rollback = previous;
+                camera.hasRollback = true;
+                qCInfo(lcRoute).noquote() << QStringLiteral("rollback point %1 %2")
+                                                 .arg(camera.binding.label,
+                                                      QString::fromUtf8(QJsonDocument(previous.toJson())
+                                                                            .toJson(QJsonDocument::Compact)));
+            }
             camera.hasProposal = false; // applied: a new capture is needed for the next pass
             ++sent;
         }
     }
+    if (errorsOut)
+        *errorsOut = errors;
+    return sent;
+}
+
+QVector<bool> MainWindow::captureActiveMask() const
+{
+    QVector<bool> mask(m_cameras.size(), false);
+    for (int i = 0; i < m_cameras.size(); ++i)
+        mask[i] = m_cameras.at(i).includeInTuning;
+    if (modeNeedsReferenceCamera() && m_referenceIndex >= 0 && m_referenceIndex < mask.size())
+        mask[m_referenceIndex] = true;
+    return mask;
+}
+
+bool MainWindow::modeNeedsReferenceCamera() const
+{
+    if (m_tuningMode == ColorMatchMode::ReferenceCamera)
+        return true;
+    if (m_tuningMode == ColorMatchMode::CommonSample)
+        return !m_sampleTargetCombo || m_sampleTargetCombo->currentData().toString() == QLatin1String("reference");
+    return false;
+}
+
+void MainWindow::fitComboPopup(QComboBox *combo)
+{
+    if (!combo)
+        return;
+    // The popup list must show full item names (e.g. «1920×1080 @ 25.00 кадр/с (UYVY)»), even when
+    // the combo itself is narrow.
+    const QFontMetrics fm(combo->view() ? combo->view()->font() : combo->font());
+    int widest = 0;
+    for (int i = 0; i < combo->count(); ++i)
+        widest = std::max(widest, fm.horizontalAdvance(combo->itemText(i)));
+    if (combo->view())
+        combo->view()->setMinimumWidth(widest + 48);
+    for (int i = 0; i < combo->count(); ++i)
+        combo->setItemData(i, combo->itemText(i), Qt::ToolTipRole);
+    combo->setToolTip(combo->currentText());
+    combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    combo->setMinimumContentsLength(std::max(combo->minimumContentsLength(), 8));
+    QObject::connect(combo, &QComboBox::currentTextChanged, combo, &QComboBox::setToolTip, Qt::UniqueConnection);
+}
+
+void MainWindow::onAutoMatchLoop()
+{
+    if (m_busy || m_loopPass > 0)
+        return;
+    if (m_tuningMode == ColorMatchMode::CameraAuto) {
+        QMessageBox::information(this, QStringLiteral("Авто-подгонка"),
+                                 QStringLiteral("В режиме встроенного автобаланса используйте «Применить»."));
+        return;
+    }
+    if (!AtemSetup::isLiveAtemControlAvailable() || !m_client || !m_client->isConnected()) {
+        QMessageBox::warning(this, QStringLiteral("Авто-подгонка"), QStringLiteral("Нет подключения к ATEM"));
+        return;
+    }
+    {
+        QMessageBox box(this);
+        box.setIcon(QMessageBox::Question);
+        box.setWindowTitle(QStringLiteral("Авто-подгонка"));
+        box.setText(QStringLiteral("До %1 раз: захват → расчёт → применение к камерам «В подстройке» → повторный "
+                                   "замер. Шаги ограничены, камеры с подозрительными значениями пропускаются. "
+                                   "«Откат» вернёт значения до начала.")
+                        .arg(m_loopMaxApplies));
+        QPushButton *go = box.addButton(QStringLiteral("Начать"), QMessageBox::AcceptRole);
+        box.addButton(QStringLiteral("Отмена"), QMessageBox::RejectRole);
+        box.setDefaultButton(go);
+        box.exec();
+        if (box.clickedButton() != go)
+            return;
+    }
+    m_loopHistory.clear();
+    m_loopPass = 1;
+    qCInfo(lcRoute).noquote() << QStringLiteral("auto loop start mode=%1").arg(colorMatchModeLogName(m_tuningMode));
+    onCaptureAnalyze();
+    if (!m_busy) // capture refused (message already shown)
+        finishAutoMatchLoop(QStringLiteral("захват не запущен"));
+}
+
+void MainWindow::continueAutoMatchLoop()
+{
+    // Called after a measurement pass (proposals are fresh, ΔE before = measured mismatch now).
+    QVector<int> toApply;
+    double worst = 0.0;
+    for (int i = 0; i < m_cameras.size(); ++i) {
+        const CameraRow &c = m_cameras.at(i);
+        if (!c.hasProposal)
+            continue;
+        worst = std::max(worst, c.deBefore);
+        if (c.warnings.isEmpty() && c.deBefore > 1.0)
+            toApply << i;
+    }
+    const int applied = m_loopPass - 1;
+    if (toApply.isEmpty()) {
+        finishAutoMatchLoop(worst <= 1.0 ? QStringLiteral("совпадение достигнуто (ΔE ≤ 1)")
+                                         : QStringLiteral("нечего применять"));
+        return;
+    }
+    if (applied >= m_loopMaxApplies) {
+        finishAutoMatchLoop(QStringLiteral("выполнено %1 прохода").arg(applied));
+        return;
+    }
+    QString errors;
+    const int sent = sendProposals(toApply, &errors);
+    qCInfo(lcRoute).noquote() << QStringLiteral("auto loop pass %1 applied to %2 camera(s) %3")
+                                     .arg(m_loopPass)
+                                     .arg(sent)
+                                     .arg(errors.trimmed());
+    if (sent == 0) {
+        finishAutoMatchLoop(QStringLiteral("ошибка отправки: %1").arg(errors.trimmed()));
+        return;
+    }
+    ++m_loopPass;
+    setCaptureStatus(QStringLiteral("Авто-подгонка: проход %1 — ждём, пока камеры применят значения…").arg(m_loopPass));
+    // Camera needs a moment to apply; then measure again.
+    QTimer::singleShot(800, this, [this] {
+        if (m_loopPass <= 0 || m_closing.load())
+            return;
+        onCaptureAnalyze();
+        if (!m_busy)
+            finishAutoMatchLoop(QStringLiteral("захват не запущен"));
+    });
+}
+
+void MainWindow::finishAutoMatchLoop(const QString &why)
+{
+    if (m_loopPass <= 0)
+        return;
+    m_loopPass = 0;
+    QStringList parts;
+    for (const CameraRow &c : m_cameras) {
+        const QVector<double> h = m_loopHistory.value(c.binding.atemId);
+        if (h.isEmpty())
+            continue;
+        QStringList v;
+        for (double d : h)
+            v << QString::number(d, 'f', 1);
+        parts << QStringLiteral("%1: ΔE %2").arg(c.binding.label, v.join(QStringLiteral(" → ")));
+    }
+    const QString text = QStringLiteral("Авто-подгонка завершена (%1). %2").arg(why, parts.join(QStringLiteral("; ")));
+    qCInfo(lcRoute).noquote() << text;
+    setCaptureStatus(text);
+    statusBar()->showMessage(text, 30000);
     refreshCorrectionsTable();
-    if (!errors.isEmpty())
-        QMessageBox::warning(this, QStringLiteral("Частичные ошибки"), errors);
-    setCaptureStatus(QStringLiteral("Отправлено на %1 камер(ы). Для уточнения повторите «Захват и расчёт».").arg(sent));
-    statusBar()->showMessage(QStringLiteral("Поправки отправлены: %1").arg(sent), 8000);
 }
 
 void MainWindow::refreshCorrectionsTable()
@@ -1990,23 +2262,38 @@ void MainWindow::refreshCorrectionsTable()
         const CameraRow &c = m_cameras.at(rows.at(r));
         auto *name = new QTableWidgetItem(c.binding.label);
         m_corrTable->setItem(r, 0, name);
+        QStringList history;
+        for (double d : m_loopHistory.value(c.binding.atemId))
+            history << QString::number(d, 'f', 1);
         if (!c.hasProposal) {
             m_corrTable->setItem(r, 1, new QTableWidgetItem(QStringLiteral("—")));
-            m_corrTable->setItem(r, 2, new QTableWidgetItem(QStringLiteral("—")));
-            m_corrTable->setItem(r, 3, new QTableWidgetItem(c.notes.join(QStringLiteral("; "))));
+            auto *deItem = new QTableWidgetItem(history.isEmpty() ? QStringLiteral("—")
+                                                                  : QStringLiteral("по проходам: ") + history.join(QStringLiteral(" → ")));
+            deItem->setToolTip(deItem->text());
+            m_corrTable->setItem(r, 2, deItem);
+            auto *noteItem = new QTableWidgetItem(c.notes.join(QStringLiteral("; ")));
+            noteItem->setToolTip(noteItem->text());
+            m_corrTable->setItem(r, 3, noteItem);
             m_corrTable->setItem(r, 4, new QTableWidgetItem());
             continue;
         }
         m_corrTable->setItem(r, 1, new QTableWidgetItem(QStringLiteral("%1 → %2")
                                                             .arg(c.errBefore, 0, 'f', 1)
                                                             .arg(c.errAfter, 0, 'f', 1)));
-        m_corrTable->setItem(r, 2, new QTableWidgetItem(c.deBefore >= 0 ? QStringLiteral("%1 → %2")
-                                                                              .arg(c.deBefore, 0, 'f', 1)
-                                                                              .arg(c.deAfter, 0, 'f', 1)
-                                                                        : QStringLiteral("—")));
+        QString deText = c.deBefore >= 0 ? QStringLiteral("%1 → %2 (прогноз)")
+                                               .arg(c.deBefore, 0, 'f', 1)
+                                               .arg(c.deAfter, 0, 'f', 1)
+                                         : QStringLiteral("—");
+        if (history.size() > 1)
+            deText = QStringLiteral("по проходам: ") + history.join(QStringLiteral(" → ")) + QLatin1Char('\n') + deText;
+        auto *deItem = new QTableWidgetItem(deText);
+        deItem->setToolTip(QStringLiteral("Первое число — измеренная разница с целью сейчас, второе — прогноз после "
+                                          "применения. «По проходам» — измерения авто-подгонки.\n")
+                           + deText);
+        m_corrTable->setItem(r, 2, deItem);
         QString change = summarizeChange(c.current, c.proposed);
         if (!c.notes.isEmpty())
-            change += QStringLiteral("  (") + c.notes.join(QStringLiteral("; ")) + QLatin1Char(')');
+            change += QStringLiteral("\n— ") + c.notes.join(QStringLiteral("\n— "));
         auto *changeItem = new QTableWidgetItem(change);
         changeItem->setToolTip(change);
         m_corrTable->setItem(r, 3, changeItem);
@@ -2014,6 +2301,14 @@ void MainWindow::refreshCorrectionsTable()
         warn->setForeground(c.warnings.isEmpty() ? QColor(120, 210, 120) : QColor(255, 120, 100));
         warn->setToolTip(warn->text());
         m_corrTable->setItem(r, 4, warn);
+        m_corrTable->item(r, 1)->setToolTip(QStringLiteral("Ошибка уровня, IRE: сейчас → прогноз"));
+    }
+    m_corrTable->resizeRowsToContents();
+    if (m_corrTable->rowCount() > 0) {
+        m_corrTable->setCurrentCell(-1, -1);
+        m_corrTable->setCurrentCell(0, 0);
+    } else if (m_corrDetails) {
+        m_corrDetails->setVisible(false);
     }
 }
 
@@ -2311,24 +2606,27 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
         return QRect(qRound(n.x() * img.width()), qRound(n.y() * img.height()), qRound(n.width() * img.width()),
                      qRound(n.height() * img.height()));
     };
-    const auto finish = [&](CameraRow &cam, const QVector<MatchEngine::Pair> &pairs, MatchEngine::Settings s) {
-        if (pairs.isEmpty()) {
-            cam.notes << QStringLiteral("нет данных для расчёта");
-            return;
-        }
-        const MatchEngine::Delta d = MatchEngine::solve(pairs, s);
+    const auto finishDelta = [&](CameraRow &cam, const MatchEngine::Delta &d, const MatchEngine::Settings &s,
+                                 int pairCount) {
+        Q_UNUSED(pairCount);
         if (!d.valid) {
             cam.notes << d.notes;
             return;
         }
         QStringList notes = d.notes;
         cam.proposed = MatchEngine::compose(cam.current, d, s, &notes);
-        cam.notes = notes;
+        cam.notes << notes;
         cam.errBefore = d.rmsBeforeIre;
         cam.errAfter = d.rmsAfterIre;
         cam.deBefore = d.deBefore;
         cam.deAfter = d.deAfter;
         cam.warnings = MatchEngine::sanityWarnings(cam.current, cam.proposed);
+        if (cam.hasRollback) {
+            // Several small passes must not add up to a wild change: check the total drift from the
+            // values before the first apply as well (the auto loop skips cameras with warnings).
+            for (const QString &w : MatchEngine::sanityWarnings(cam.rollback, cam.proposed))
+                cam.warnings << QStringLiteral("от исходных значений: %1").arg(w);
+        }
         if (!cam.currentOk)
             cam.warnings << QStringLiteral("текущие значения камеры не прочитаны (нет Camera Control?) — "
                                            "поправка отсчитана от заводских");
@@ -2344,6 +2642,15 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                                          .arg(d.deBefore, 0, 'f', 2)
                                          .arg(d.deAfter, 0, 'f', 2)
                                          .arg(summarizeChange(cam.current, cam.proposed));
+        if (m_loopPass > 0 && d.deBefore >= 0)
+            m_loopHistory[cam.binding.atemId] << d.deBefore;
+    };
+    const auto finish = [&](CameraRow &cam, const QVector<MatchEngine::Pair> &pairs, MatchEngine::Settings s) {
+        if (pairs.isEmpty()) {
+            cam.notes << QStringLiteral("нет данных для расчёта");
+            return;
+        }
+        finishDelta(cam, MatchEngine::solve(pairs, s), s, pairs.size());
     };
     const auto neutralPair = [&](const MatchEngine::Rgb &m, bool toTargetLevel) {
         MatchEngine::Pair p;
@@ -2356,15 +2663,36 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
     };
     QStringList failures;
 
-    // No signal on an input (black frame) must never produce a correction.
-    for (CameraRow &cam : m_cameras) {
+    // No signal on an input must never produce a correction. "No signal" = essentially constant frame
+    // (no detail, no noise); a dark but real scene is processed with a «мало света» note.
+    const QVector<bool> activeMask = captureActiveMask();
+    const auto participates = [&](int i) { return i >= 0 && i < m_cameras.size() && m_cameras.at(i).includeInTuning; };
+    QVector<MatchEngine::SignalCheck> signal(m_cameras.size());
+    for (int i = 0; i < m_cameras.size(); ++i) {
+        CameraRow &cam = m_cameras[i];
+        if (!activeMask.value(i, false)) {
+            cam.lastFrame = QImage();
+            cam.analysis = FrameColorAnalysis();
+            continue;
+        }
         if (cam.lastFrame.isNull())
             continue;
-        const MatchEngine::Rgb mean = MatchEngine::regionMean(cam.lastFrame);
-        if (ColorScience::luma(mean) < 0.03) {
-            cam.notes << QStringLiteral("чёрный кадр — нет сигнала на входе?");
+        signal[i] = MatchEngine::checkSignal(cam.lastFrame);
+        qCInfo(lcRoute).noquote() << QStringLiteral("signal %1 mean=%2 p99=%3 std=%4 detail=%5 %6")
+                                         .arg(cam.binding.label)
+                                         .arg(signal[i].meanLuma * 255, 0, 'f', 1)
+                                         .arg(signal[i].p99Luma * 255, 0, 'f', 0)
+                                         .arg(signal[i].stdLuma * 255, 0, 'f', 2)
+                                         .arg(signal[i].detail * 255, 0, 'f', 2)
+                                         .arg(signal[i].noSignal ? QStringLiteral("NO-SIGNAL")
+                                                                 : (signal[i].lowLight ? QStringLiteral("low-light")
+                                                                                       : QStringLiteral("ok")));
+        if (signal[i].noSignal) {
+            cam.notes << signal[i].reason;
             cam.lastFrame = QImage();
             cam.analysis.sampleCount = 0;
+        } else if (signal[i].lowLight) {
+            cam.notes << signal[i].reason;
         }
     }
 
@@ -2401,12 +2729,59 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
             }
             target = ColorTuning::averageAnalyses(parts);
         }
+        // Reference camera / frame: robust scene statistics (light colour, median level, percentiles)
+        // instead of comparing whole-frame histograms of different scenes.
+        const auto roiImage = [&](const CameraRow &c) {
+            const QRect r = roiRect(c.lastFrame, c.grayRoi);
+            return r.isEmpty() ? c.lastFrame : c.lastFrame.copy(r);
+        };
+        MatchEngine::SceneStats refStats;
+        if (m_tuningMode == ColorMatchMode::ReferenceCamera && !m_cameras.at(refIndex).lastFrame.isNull()) {
+            QStringList refNotes;
+            refStats = MatchEngine::sceneStats(roiImage(m_cameras.at(refIndex)), st.transfer, &refNotes);
+            if (!refStats.valid)
+                failures << QStringLiteral("Кадр эталонной камеры непригоден: %1").arg(refNotes.join(QStringLiteral("; ")));
+        } else if (m_tuningMode == ColorMatchMode::ReferenceFrame && !m_referenceFrameImage.isNull()) {
+            refStats = MatchEngine::sceneStats(m_referenceFrameImage, st.transfer);
+        }
         for (int i = 0; i < m_cameras.size(); ++i) {
             CameraRow &cam = m_cameras[i];
-            if (i == refIndex || cam.analysis.sampleCount == 0)
+            if (i == refIndex || cam.analysis.sampleCount == 0 || !participates(i))
                 continue;
-            if (m_tuningMode == ColorMatchMode::CameraAverage && !cam.includeInTuning)
+            if (refStats.valid && !cam.lastFrame.isNull()) {
+                QStringList pre;
+                const MatchEngine::SceneStats cs = MatchEngine::sceneStats(roiImage(cam), st.transfer, &pre);
+                if (!cs.valid) {
+                    cam.notes << pre;
+                    continue;
+                }
+                MatchEngine::Settings sm = st;
+                const bool commonRegion = m_tuningMode == ColorMatchMode::ReferenceCamera && !cam.grayRoi.isEmpty()
+                                          && !m_cameras.at(refIndex).grayRoi.isEmpty();
+                if ((st.lift || st.gamma || st.saturation) && !commonRegion) {
+                    // Different framings: tone and saturation statistics describe the scene, not the camera.
+                    sm.lift = sm.gamma = sm.saturation = false;
+                    pre << QStringLiteral("лифт/гамма/насыщенность не подбираются: кадры разные — выделите общую "
+                                          "область на эталоне и камере");
+                }
+                const MatchEngine::ReferenceMatch rm = MatchEngine::referenceMatch(cs, refStats, sm, &pre);
+                MatchEngine::Settings s2 = sm;
+                s2.saturation = false; // saturation comes from the median-chroma ratio, not from pairs
+                MatchEngine::Delta d = MatchEngine::solve(rm.pairs, s2);
+                if (sm.saturation)
+                    d.saturation = rm.saturation;
+                cam.notes << pre;
+                finishDelta(cam, d, sm, rm.pairs.size());
+                qCInfo(lcRoute).noquote()
+                    << QStringLiteral("refmatch %1 ill %2/%3/%4 -> %5/%6/%7 p50 %8 -> %9 neutral %10%")
+                           .arg(cam.binding.label)
+                           .arg(cs.illuminant.r, 0, 'f', 3).arg(cs.illuminant.g, 0, 'f', 3).arg(cs.illuminant.b, 0, 'f', 3)
+                           .arg(refStats.illuminant.r, 0, 'f', 3).arg(refStats.illuminant.g, 0, 'f', 3)
+                           .arg(refStats.illuminant.b, 0, 'f', 3)
+                           .arg(cs.p50Linear, 0, 'f', 4).arg(refStats.p50Linear, 0, 'f', 4)
+                           .arg(cs.neutralFraction * 100, 0, 'f', 1);
                 continue;
+            }
             finish(cam, MatchEngine::quantilePairs(roiAnalysis(cam), target), st);
         }
         break;
@@ -2462,7 +2837,7 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
         }
         for (int i = 0; i < m_cameras.size(); ++i) {
             CameraRow &cam = m_cameras[i];
-            if (!ok[i] || i == refIndex)
+            if (!ok[i] || i == refIndex || !participates(i))
                 continue;
             if (cam.grayRoi.isEmpty())
                 cam.notes << QStringLiteral("область не выделена — весь кадр");
@@ -2475,9 +2850,7 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                 p.target = target;
                 pairs << p;
             }
-            const QStringList pre = cam.notes;
             finish(cam, pairs, st);
-            cam.notes = pre + cam.notes;
         }
         break;
     }
@@ -2485,7 +2858,7 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
         const ChartPreset chart = ColorCharts::byId(m_chartCombo ? m_chartCombo->currentData().toString()
                                                                  : QStringLiteral("cc24"));
         for (CameraRow &cam : m_cameras) {
-            if (cam.lastFrame.isNull())
+            if (cam.lastFrame.isNull() || !cam.includeInTuning)
                 continue;
             if (cam.checkerCorners.size() != 4) {
                 cam.notes << QStringLiteral("не отмечены 4 угла таблицы");
@@ -2506,6 +2879,7 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                 pairs << p;
             }
             MatchEngine::Settings s = st;
+            s.liveLimits = false; // exact chart reference: full step
             finish(cam, pairs, s);
             if (rot != 0)
                 cam.notes << QStringLiteral("таблица повёрнута на %1°").arg(rot * 90);
@@ -2514,12 +2888,12 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
     }
     case ColorMatchMode::NeutralBalance: {
         for (CameraRow &cam : m_cameras) {
-            if (cam.lastFrame.isNull())
+            if (cam.lastFrame.isNull() || !cam.includeInTuning)
                 continue;
             QStringList notes;
             const QVector<MatchEngine::Pair> pairs = MatchEngine::autoPairs(cam.lastFrame, st, targetIre, nullptr, &notes);
+            cam.notes << notes;
             finish(cam, pairs, st);
-            cam.notes = notes + cam.notes;
         }
         break;
     }
@@ -2527,6 +2901,15 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
 
     refreshCorrectionsTable();
     QStringList all = problems + failures;
+    if (m_loopPass > 0) {
+        if (!failures.isEmpty()) {
+            finishAutoMatchLoop(failures.join(QStringLiteral("; ")));
+            QMessageBox::warning(this, QStringLiteral("Расчёт"), all.join(QLatin1Char('\n')));
+            return;
+        }
+        continueAutoMatchLoop();
+        return;
+    }
     if (!all.isEmpty())
         QMessageBox::warning(this, QStringLiteral("Расчёт"), all.join(QLatin1Char('\n')));
     int ready = 0;
@@ -2652,7 +3035,11 @@ QString summarizeChange(const CameraCorrectionBundle &a, const CameraCorrectionB
     if (changed(a.gainR, b.gainR, 0.005f) || changed(a.gainG, b.gainG, 0.005f) || changed(a.gainB, b.gainB, 0.005f))
         parts << QStringLiteral("Gain RGB %1→%2").arg(f3(a.gainR, a.gainG, a.gainB), f3(b.gainR, b.gainG, b.gainB));
     if (changed(a.gainY, b.gainY, 0.005f))
-        parts << QStringLiteral("Gain Y %1→%2").arg(a.gainY, 0, 'f', 2).arg(b.gainY, 0, 'f', 2);
+        parts << QStringLiteral("Уровень (Gain Y) %1→%2").arg(a.gainY, 0, 'f', 2).arg(b.gainY, 0, 'f', 2);
+    if (changed(a.liftY, b.liftY, 0.003f))
+        parts << QStringLiteral("Lift Y %1→%2").arg(a.liftY, 0, 'f', 3).arg(b.liftY, 0, 'f', 3);
+    if (changed(a.gammaY, b.gammaY, 0.003f))
+        parts << QStringLiteral("Gamma Y %1→%2").arg(a.gammaY, 0, 'f', 3).arg(b.gammaY, 0, 'f', 3);
     if (changed(a.liftR, b.liftR, 0.003f) || changed(a.liftG, b.liftG, 0.003f) || changed(a.liftB, b.liftB, 0.003f))
         parts << QStringLiteral("Lift %1→%2").arg(f3(a.liftR, a.liftG, a.liftB), f3(b.liftR, b.liftG, b.liftB));
     if (changed(a.gammaR, b.gammaR, 0.003f) || changed(a.gammaG, b.gammaG, 0.003f) || changed(a.gammaB, b.gammaB, 0.003f))
@@ -2671,7 +3058,7 @@ QString summarizeChange(const CameraCorrectionBundle &a, const CameraCorrectionB
         parts << QStringLiteral("Диафрагма f/%1→f/%2")
                      .arg(a.irisFStopAv >= 0 ? std::sqrt(std::pow(2.0, a.irisFStopAv)) : 0.0, 0, 'f', 1)
                      .arg(std::sqrt(std::pow(2.0, b.irisFStopAv)), 0, 'f', 1);
-    return parts.isEmpty() ? QStringLiteral("без изменений") : parts.join(QStringLiteral(", "));
+    return parts.isEmpty() ? QStringLiteral("без изменений") : parts.join(QStringLiteral("\n"));
 }
 
 } // namespace
@@ -2691,6 +3078,7 @@ MatchEngine::Settings MainWindow::engineSettings() const
     s.exposureVia = ev == 1 ? MatchEngine::ExposureVia::SensorGain
                             : (ev == 2 ? MatchEngine::ExposureVia::Iris : MatchEngine::ExposureVia::CcGain);
     s.strength = (m_strengthSpin ? m_strengthSpin->value() : 100) / 100.0;
+    s.liveLimits = true; // per-pass limits; the closed loop / repeated capture converges
     return s;
 }
 
@@ -2766,16 +3154,22 @@ void MainWindow::saveEngineSettings()
 
 void MainWindow::readCurrentCameraValues()
 {
-    for (CameraRow &cam : m_cameras) {
+    const QVector<bool> active = captureActiveMask();
+    for (int i = 0; i < m_cameras.size(); ++i) {
+        CameraRow &cam = m_cameras[i];
         cam.current = CameraCorrectionBundle();
         cam.currentOk = false;
-        if (!m_client || !m_client->isConnected())
+        if (!m_client || !m_client->isConnected() || !active.value(i, false))
             continue;
         CameraCorrectionBundle cur;
         const QString err = m_client->readCorrectionBundle(cam.binding.atemId, cur);
         if (err.isEmpty()) {
             cam.current = cur;
             cam.currentOk = true;
+            qCInfo(lcRoute).noquote() << QStringLiteral("camera %1 now %2")
+                                             .arg(cam.binding.label,
+                                                  QString::fromUtf8(QJsonDocument(cur.toJson())
+                                                                        .toJson(QJsonDocument::Compact)));
         } else {
             qCWarning(lcRoute).noquote() << QStringLiteral("read camera %1 failed: %2").arg(cam.binding.atemId).arg(err);
         }
@@ -2873,7 +3267,7 @@ void MainWindow::applyCameraPreset(const QString &name)
         }
         ++sent;
         for (CameraRow &cam : m_cameras)
-            if (cam.binding.atemId == e.atemId) {
+            if (cam.binding.atemId == e.atemId && !cam.hasRollback) {
                 cam.rollback = previous;
                 cam.hasRollback = true;
             }
