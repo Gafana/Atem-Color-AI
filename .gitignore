@@ -29,3 +29,8 @@ Thumbs.db
 *.dylib
 *.exe
 *.dll
+build-installer/
+Testing/
+
+# App logo (sources for the exe icon / Qt resources)
+!resources/icons/*.png

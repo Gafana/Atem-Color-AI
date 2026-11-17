@@ -1,3 +1,5 @@
+<p align="center"><img src="resources/icons/app-icon-256.png" width="128" alt="Atem Color AI"></p>
+
 # Atem-Color-AI
 
 Десктопное приложение на **Qt/C++** для автоматизации цветокоррекции и сведения настроек камер Blackmagic через пульт **ATEM**.

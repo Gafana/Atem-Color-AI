@@ -32,6 +32,16 @@ void clampBundle(CameraCorrectionBundle &bundle)
     bundle.gainB = clampf(bundle.gainB, kGainMin, kGainMax);
     bundle.gainY = clampf(bundle.gainY, kGainMin, kGainMax);
 
+    bundle.offsetR = clampf(bundle.offsetR, -8.0f, 8.0f);
+    bundle.offsetG = clampf(bundle.offsetG, -8.0f, 8.0f);
+    bundle.offsetB = clampf(bundle.offsetB, -8.0f, 8.0f);
+    bundle.offsetY = clampf(bundle.offsetY, -8.0f, 8.0f);
+    bundle.contrastPivot = clampf(bundle.contrastPivot, 0.0f, 1.0f);
+    bundle.contrastAdj = clampf(bundle.contrastAdj, 0.0f, 2.0f);
+    bundle.lumaMix = clampf(bundle.lumaMix, 0.0f, 1.0f);
+    if (bundle.irisFStopAv >= 0.0f)
+        bundle.irisFStopAv = clampf(bundle.irisFStopAv, 0.0f, 16.0f);
+
     bundle.saturation = clampf(bundle.saturation, kSatMin, kSatMax);
     bundle.hue = clampf(bundle.hue, -1.0f, 1.0f);
 
@@ -86,7 +96,9 @@ bool CameraCorrectionBundle::operator==(const CameraCorrectionBundle &other) con
            && saturation == other.saturation && hue == other.hue
            && whiteBalanceKelvin == other.whiteBalanceKelvin
            && whiteBalanceTint == other.whiteBalanceTint && gainDb == other.gainDb
-           && irisFStopAv == other.irisFStopAv;
+           && irisFStopAv == other.irisFStopAv && offsetR == other.offsetR && offsetG == other.offsetG
+           && offsetB == other.offsetB && offsetY == other.offsetY && contrastPivot == other.contrastPivot
+           && contrastAdj == other.contrastAdj && lumaMix == other.lumaMix;
 }
 
 QJsonObject CameraCorrectionBundle::toJson() const
@@ -95,6 +107,9 @@ QJsonObject CameraCorrectionBundle::toJson() const
     o.insert(QStringLiteral("lift"), QJsonArray{liftR, liftG, liftB, liftY});
     o.insert(QStringLiteral("gamma"), QJsonArray{gammaR, gammaG, gammaB, gammaY});
     o.insert(QStringLiteral("gain"), QJsonArray{gainR, gainG, gainB, gainY});
+    o.insert(QStringLiteral("offset"), QJsonArray{offsetR, offsetG, offsetB, offsetY});
+    o.insert(QStringLiteral("contrast"), QJsonArray{contrastPivot, contrastAdj});
+    o.insert(QStringLiteral("lumaMix"), lumaMix);
     o.insert(QStringLiteral("saturation"), saturation);
     o.insert(QStringLiteral("hue"), hue);
     o.insert(QStringLiteral("whiteBalanceKelvin"), whiteBalanceKelvin);
@@ -120,6 +135,15 @@ CameraCorrectionBundle CameraCorrectionBundle::fromJson(const QJsonObject &obj)
     read4("lift", b.liftR, b.liftG, b.liftB, b.liftY);
     read4("gamma", b.gammaR, b.gammaG, b.gammaB, b.gammaY);
     read4("gain", b.gainR, b.gainG, b.gainB, b.gainY);
+    read4("offset", b.offsetR, b.offsetG, b.offsetB, b.offsetY);
+    {
+        const QJsonArray arr = obj.value(QStringLiteral("contrast")).toArray();
+        if (arr.size() >= 2) {
+            b.contrastPivot = static_cast<float>(arr.at(0).toDouble(0.5));
+            b.contrastAdj = static_cast<float>(arr.at(1).toDouble(1.0));
+        }
+    }
+    b.lumaMix = static_cast<float>(obj.value(QStringLiteral("lumaMix")).toDouble(1.0));
     b.saturation = static_cast<float>(obj.value(QStringLiteral("saturation")).toDouble(1.0));
     b.hue = static_cast<float>(obj.value(QStringLiteral("hue")).toDouble(0.0));
     b.whiteBalanceKelvin = obj.value(QStringLiteral("whiteBalanceKelvin")).toInt(5600);

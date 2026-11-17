@@ -66,6 +66,135 @@ QString ColorAnalysis::loadImage(const QString &path, QImage &out)
     return {};
 }
 
+FrameColorAnalysis ColorAnalysis::analyze(const QImage &image, const QRect &region)
+{
+    if (image.isNull())
+        return {};
+    const QRect rect = region.isEmpty() ? image.rect() : region.intersected(image.rect());
+    if (rect.isEmpty())
+        return {};
+    if (rect == image.rect())
+        return analyze(image);
+    return analyze(image.copy(rect));
+}
+
+FrameColorAnalysis ColorAnalysis::mergeAccumulate(const FrameColorAnalysis &accumulator,
+                                                  const FrameColorAnalysis &sample)
+{
+    FrameColorAnalysis out = accumulator;
+    if (sample.sampleCount == 0)
+        return out;
+    for (int i = 0; i < kHistogramBins; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        out.histR[idx] += sample.histR[idx];
+        out.histG[idx] += sample.histG[idx];
+        out.histB[idx] += sample.histB[idx];
+        out.histY[idx] += sample.histY[idx];
+        out.histU[idx] += sample.histU[idx];
+        out.histV[idx] += sample.histV[idx];
+    }
+    out.sampleCount += sample.sampleCount;
+    out.width = sample.width;
+    out.height = sample.height;
+    return out;
+}
+
+void ColorAnalysis::finalizeMerged(FrameColorAnalysis &accumulator)
+{
+    if (accumulator.sampleCount == 0)
+        return;
+    auto stats = [&](const std::array<quint32, kHistogramBins> &hist, ChannelStats &target) {
+        double sum = 0.0;
+        for (int i = 0; i < kHistogramBins; ++i)
+            sum += static_cast<double>(i) * hist[static_cast<size_t>(i)];
+        target.mean = sum / static_cast<double>(accumulator.sampleCount);
+        const auto percentile = [&](double p) {
+            const quint64 targetCount =
+                static_cast<quint64>(std::llround(p * static_cast<double>(accumulator.sampleCount - 1)));
+            quint64 acc = 0;
+            for (int i = 0; i < kHistogramBins; ++i) {
+                acc += hist[static_cast<size_t>(i)];
+                if (acc > targetCount)
+                    return static_cast<double>(i);
+            }
+            return 255.0;
+        };
+        target.median = percentile(0.5);
+        target.p2 = percentile(0.02);
+        target.p98 = percentile(0.98);
+    };
+    stats(accumulator.histR, accumulator.statsR);
+    stats(accumulator.histG, accumulator.statsG);
+    stats(accumulator.histB, accumulator.statsB);
+    stats(accumulator.histY, accumulator.statsY);
+    stats(accumulator.histU, accumulator.statsU);
+    stats(accumulator.histV, accumulator.statsV);
+}
+
+CameraCorrectionBundle ColorAnalysis::neutralBalanceCorrection(const QImage &image,
+                                                                 const NeutralBalanceOptions &opts)
+{
+    if (image.isNull())
+        return {};
+    const QImage rgb = image.format() == QImage::Format_RGB32
+                           ? image
+                           : image.convertToFormat(QImage::Format_RGB32);
+
+    qint64 sumR = 0;
+    qint64 sumG = 0;
+    qint64 sumB = 0;
+    quint64 brightCount = 0;
+    qint64 brightR = 0;
+    qint64 brightG = 0;
+    qint64 brightB = 0;
+
+    for (int y = 0; y < rgb.height(); ++y) {
+        const QRgb *row = reinterpret_cast<const QRgb *>(rgb.constScanLine(y));
+        for (int x = 0; x < rgb.width(); ++x) {
+            const int r = qRed(row[x]);
+            const int g = qGreen(row[x]);
+            const int b = qBlue(row[x]);
+            const int yy = static_cast<int>(0.2126 * r + 0.7152 * g + 0.0722 * b);
+            const int chroma = qMax(qAbs(r - g), qAbs(b - g));
+            if (chroma > opts.neutralChromaMax)
+                continue;
+            sumR += r;
+            sumG += g;
+            sumB += b;
+            ++brightCount;
+            if (yy >= opts.highlightLumaMin) {
+                brightR += r;
+                brightG += g;
+                brightB += b;
+            }
+        }
+    }
+
+    quint64 used = brightCount;
+    qint64 useR = sumR;
+    qint64 useG = sumG;
+    qint64 useB = sumB;
+    if (brightR + brightG + brightB > 0 && brightCount > rgb.width()) {
+        useR = brightR;
+        useG = brightG;
+        useB = brightB;
+        used = brightCount;
+    }
+    if (used == 0)
+        return {};
+
+    const double r = static_cast<double>(useR) / static_cast<double>(used);
+    const double g = static_cast<double>(useG) / static_cast<double>(used);
+    const double b = static_cast<double>(useB) / static_cast<double>(used);
+    CameraCorrectionBundle corr;
+    corr.whiteBalanceKelvin =
+        opts.kelvinBase + static_cast<int>(std::lround((b - r) / 255.0 * 2200.0));
+    corr.whiteBalanceTint =
+        static_cast<int>(qBound(-50.0, -(g - (r + b) * 0.5) / 255.0 * 100.0, 50.0));
+    corr.clamp();
+    return corr;
+}
+
 FrameColorAnalysis ColorAnalysis::analyze(const QImage &image)
 {
     FrameColorAnalysis result;

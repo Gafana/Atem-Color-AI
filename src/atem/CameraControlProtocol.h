@@ -10,8 +10,10 @@ constexpr uint8_t kCategoryVideo = 1;
 constexpr uint8_t kCategoryColorCorrection = 8;
 
 constexpr uint8_t kLensApertureFStop = 2;
+constexpr uint8_t kLensAutoAperture = 5;   // void: instantaneous auto aperture
 
 constexpr uint8_t kVideoManualWhiteBalance = 2;
+constexpr uint8_t kVideoAutoWhiteBalance = 3; // void: calculate and set auto WB
 constexpr uint8_t kVideoGainDb = 13;
 
 constexpr uint8_t kCcLift = 0;

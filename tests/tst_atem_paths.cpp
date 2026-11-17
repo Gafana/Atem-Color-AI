@@ -20,6 +20,8 @@ private Q_SLOTS:
     void softwareControlValidationExe();
     void settingsRoundTrip();
     void controlSavePreservesSdkPath();
+    void ipSurvivesPathSave();
+    void cameraMapRoundTrip();
 };
 
 void TestAtemPaths::initTestCase()
@@ -118,6 +120,61 @@ void TestAtemPaths::controlSavePreservesSdkPath()
 
     const auto sdkCheck = AtemPathValidation::validateSdkPath(sdk);
     QVERIFY(!sdkCheck.valid);
+}
+
+void TestAtemPaths::ipSurvivesPathSave()
+{
+    AtemAppSettings::reset();
+    AtemAppSettings::setIp(QStringLiteral(" 10.0.0.8 "));
+    QCOMPARE(AtemAppSettings::ip(), QStringLiteral("10.0.0.8"));
+
+    AtemAppSettings::save(QStringLiteral("/sdk/kept"), QStringLiteral("/control/old"), true);
+    QCOMPARE(AtemAppSettings::ip(), QStringLiteral("10.0.0.8"));
+
+    QString sdk;
+    QString control;
+    bool done = false;
+    AtemAppSettings::load(&sdk, &control, &done);
+    QCOMPARE(sdk, QStringLiteral("/sdk/kept"));
+    QCOMPARE(control, QStringLiteral("/control/old"));
+    QVERIFY(done);
+
+    QFile file(AtemAppSettings::settingsFilePath());
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const QString ini = QString::fromUtf8(file.readAll());
+    QVERIFY(ini.contains(QStringLiteral("10.0.0.8")));
+    QVERIFY(ini.contains(QStringLiteral("ip")));
+}
+
+void TestAtemPaths::cameraMapRoundTrip()
+{
+    AtemAppSettings::reset();
+    CameraBinding first;
+    first.label = QStringLiteral("Cam A");
+    first.atemId = 4;
+    first.multiviewWindow = 2;
+    CameraBinding second;
+    second.label = QStringLiteral("Cam B");
+    second.atemId = 8;
+    second.multiviewWindow = 0;
+    AtemAppSettings::setCameraMap({first, second});
+    AtemAppSettings::setCaptureRoute(QStringLiteral("multiview"));
+    AtemAppSettings::setAuxOutputId(1002);
+    AtemAppSettings::setVideoDeviceId(QStringLiteral("dshow|cam"));
+
+    const QVector<CameraBinding> rows = AtemAppSettings::cameraMap();
+    QCOMPARE(rows.size(), 2);
+    QCOMPARE(rows.at(0).label, QStringLiteral("Cam A"));
+    QCOMPARE(rows.at(0).atemId, static_cast<qint64>(4));
+    QCOMPARE(rows.at(0).multiviewWindow, 2);
+    QCOMPARE(rows.at(1).label, QStringLiteral("Cam B"));
+    QCOMPARE(AtemAppSettings::captureRoute(), QStringLiteral("multiview"));
+    QCOMPARE(AtemAppSettings::auxOutputId(), static_cast<qint64>(1002));
+    QCOMPARE(AtemAppSettings::videoDeviceId(), QStringLiteral("dshow|cam"));
+
+    AtemAppSettings::save(QStringLiteral("/sdk"), QStringLiteral("/control"), true);
+    QCOMPARE(AtemAppSettings::cameraMap().size(), 2);
+    QCOMPARE(AtemAppSettings::ip(), QString());
 }
 
 QTEST_MAIN(TestAtemPaths)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QImage>
+#include <QMetaType>
 #include <QString>
 #include <QVector>
 #include <array>
@@ -40,10 +41,25 @@ struct FrameColorAnalysis
     int height = 0;
 };
 
+Q_DECLARE_METATYPE(FrameColorAnalysis)
+
 struct FrameComparisonMetrics
 {
     double meanDeltaLuma = 0.0;
     double histogramL1Rgb = 0.0;
     double percentileSpreadDelta = 0.0;
     double uvEnergyRatio = 1.0;
+};
+
+struct GrayCardTuningOptions
+{
+    double targetLuma = 110.0;
+    bool matchExposure = true;
+};
+
+struct NeutralBalanceOptions
+{
+    double highlightLumaMin = 200.0;
+    double neutralChromaMax = 18.0;
+    int kelvinBase = 5600;
 };
