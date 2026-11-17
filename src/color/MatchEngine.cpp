@@ -193,6 +193,20 @@ double linearRatioOfEncodedGain(double g, Transfer t)
     return a > 1e-9 ? b / a : 1.0;
 }
 
+// Inverse of linearRatioOfEncodedGain: encoded gain at mid-grey that gives the linear ratio @p r.
+double encodedGainOfLinearRatio(double r, Transfer t)
+{
+    const double a = decode(kMidGreyEncoded, t);
+    if (a * r >= 1.0)
+        return std::pow(r, 0.45);
+    return encode(a * std::max(0.0, r), t) / kMidGreyEncoded;
+}
+
+QString fNumber(double av)
+{
+    return QStringLiteral("f/%1").arg(std::sqrt(std::pow(2.0, av)), 0, 'f', 1);
+}
+
 } // namespace
 
 double ChannelCurve::apply(double x) const
@@ -341,9 +355,10 @@ Delta solve(const QVector<Pair> &pairsIn, const Settings &st)
     return d;
 }
 
-CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d, const Settings &st,
+CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &dIn, const Settings &st,
                                QStringList *notes)
 {
+    Delta d = dIn;
     CameraCorrectionBundle out = cur;
     if (!d.valid)
         return out;
@@ -354,7 +369,53 @@ CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d
     double bal[3] = {g[0] / level, g[1] / level, g[2] / level};
     double levelForCc = level;
 
-    if (st.exposure && st.exposureVia != ExposureVia::CcGain && std::fabs(level - 1.0) > 1e-4) {
+    if (st.exposure && st.exposureVia == ExposureVia::Auto) {
+        // Light first. The current Gain Y is folded in too, so a level that an earlier pass (or a
+        // manual setting) put into Gain Y moves back to the iris / sensor gain.
+        const bool absorbY = std::fabs(std::log2(std::max(1e-6, linearRatioOfEncodedGain(cur.gainY, st.transfer))))
+                             > 0.1;
+        const double encTotal = level * (absorbY ? cur.gainY : 1.0);
+        const double stops = std::log2(std::max(1e-6, linearRatioOfEncodedGain(encTotal, st.transfer)));
+        const bool irisOk = st.irisUsable && cur.irisFStopAv >= 0.0f;
+        const LevelPlan plan = planAutoLevel(stops, irisOk ? cur.irisFStopAv : -1.0, cur.gainDb, irisOk,
+                                             !st.liveLimits);
+        if (plan.irisAv >= 0.0 && std::fabs(plan.irisAv - cur.irisFStopAv) > 1e-3)
+            out.irisFStopAv = static_cast<float>(plan.irisAv);
+        out.gainDb = plan.gainDb;
+        if (std::fabs(plan.appliedStops) > 0.5) {
+            // Exposure first: lift/gamma/saturation were fitted on a picture at the wrong level (live test:
+            // removing Lift Y in the same pass as +25 dB made a dark scene 5x darker) - next pass.
+            bool held = std::fabs(d.saturation - 1.0) > 1e-3;
+            for (int c = 0; c < 3; ++c) {
+                held = held || std::fabs(d.ch[c].lift) > 1e-4 || std::fabs(d.ch[c].gamma) > 1e-4;
+                d.ch[c].lift = 0.0;
+                d.ch[c].gamma = 0.0;
+            }
+            d.saturation = 1.0;
+            if (held && notes)
+                *notes << QStringLiteral("сначала свет: лифт/гамма/насыщенность — на следующем проходе");
+        }
+        const double achievedEnc = encodedGainOfLinearRatio(std::pow(2.0, plan.appliedStops), st.transfer);
+        // new Gain Y = current * wanted encoded change / change achieved with light
+        levelForCc = achievedEnc > 1e-6 ? level / achievedEnc : level;
+        if (notes) {
+            QStringList used;
+            if (std::fabs(out.irisFStopAv - cur.irisFStopAv) > 1e-3)
+                used << QStringLiteral("диафрагма %1 → %2").arg(fNumber(cur.irisFStopAv), fNumber(out.irisFStopAv));
+            if (out.gainDb != cur.gainDb)
+                used << QStringLiteral("усиление %1 → %2 dB").arg(cur.gainDb).arg(out.gainDb);
+            const double newY = cur.gainY * levelForCc;
+            if (std::fabs(newY - cur.gainY) > 0.005)
+                used << QStringLiteral("Gain Y %1 → %2").arg(cur.gainY, 0, 'f', 2).arg(newY, 0, 'f', 2);
+            *notes << QStringLiteral("авто-уровень (%1 ступ.): %2")
+                          .arg(stops, 0, 'f', 2)
+                          .arg(used.isEmpty() ? QStringLiteral("без изменений") : used.join(QStringLiteral(", ")));
+            if (cur.irisFStopAv >= 0.0f && !st.irisUsable)
+                *notes << QStringLiteral("диафрагма не реагирует — уровень через усиление");
+            else if (cur.irisFStopAv < 0.0f)
+                *notes << QStringLiteral("диафрагма камеры неизвестна — уровень через усиление");
+        }
+    } else if (st.exposure && st.exposureVia != ExposureVia::CcGain && std::fabs(level - 1.0) > 1e-4) {
         const double linear = linearRatioOfEncodedGain(level, st.transfer);
         const double stops = std::log2(std::max(1e-6, linear));
         if (st.exposureVia == ExposureVia::SensorGain) {
@@ -381,7 +442,45 @@ CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d
         }
     }
 
-    if (st.balance && st.balanceVia == BalanceVia::WhiteBalance) {
+    if (st.balance && st.balanceVia == BalanceVia::Auto) {
+        // Bulk cast -> camera white balance (on the sensor), residual -> RGB CC gain.
+        const Rgb m{linearRatioOfEncodedGain(bal[0] / bal[1], st.transfer), 1.0,
+                    linearRatioOfEncodedGain(bal[2] / bal[1], st.transfer)};
+        const double bulk = std::max(std::fabs(std::log(m.r)), std::fabs(std::log(m.b)));
+        if (bulk > 0.03) {
+            const double k0 = cur.whiteBalanceKelvin > 0 ? cur.whiteBalanceKelvin : 5600.0;
+            const Rgb w0 = planckianWhite(k0);
+            const double k1 = estimateKelvin(Rgb{w0.r / m.r, 1.0, w0.b / m.b});
+            int kOut = qBound(2500, static_cast<int>(std::lround(k1 / 50.0) * 50), 10000);
+            if (st.liveLimits)
+                kOut = qBound(static_cast<int>(k0) - 1000, kOut, static_cast<int>(k0) + 1000);
+            const Rgb w1 = planckianWhite(kOut);
+            const double ar = w0.r / w1.r;
+            const double ab = w0.b / w1.b;
+            const double rho = std::sqrt((m.r / ar) * (m.b / ab));
+            int tOut = qBound(-50, static_cast<int>(std::lround(cur.whiteBalanceTint + std::log(rho) / kTintPerUnit)), 50);
+            if (st.liveLimits)
+                tOut = qBound(cur.whiteBalanceTint - 10, tOut, cur.whiteBalanceTint + 10);
+            out.whiteBalanceKelvin = kOut;
+            out.whiteBalanceTint = tOut;
+            const double tf = std::exp(kTintPerUnit * (tOut - cur.whiteBalanceTint));
+            // The white balance takes the bulk; the CC residual is a trim (±25 %) - a larger residual means
+            // the estimate is unreliable (e.g. a noisy dark frame), the next pass refines it.
+            const double rr = std::clamp(encodedGainOfLinearRatio(m.r / (ar * tf), st.transfer), 0.8, 1.25);
+            const double rb = std::clamp(encodedGainOfLinearRatio(m.b / (ab * tf), st.transfer), 0.8, 1.25);
+            const double norm = kLumaR * rr + kLumaG + kLumaB * rb;
+            bal[0] = rr / norm;
+            bal[1] = 1.0 / norm;
+            bal[2] = rb / norm;
+            if (notes)
+                *notes << QStringLiteral("авто-цвет: ББ %1 K / tint %2 → %3 K / tint %4, остаток через CC Gain "
+                                         "R×%5 B×%6")
+                              .arg(cur.whiteBalanceKelvin).arg(cur.whiteBalanceTint).arg(kOut).arg(tOut)
+                              .arg(bal[0] / bal[1], 0, 'f', 3).arg(bal[2] / bal[1], 0, 'f', 3);
+        } else if (notes) {
+            *notes << QStringLiteral("авто-цвет: небольшой оттенок — только CC Gain");
+        }
+    } else if (st.balance && st.balanceVia == BalanceVia::WhiteBalance) {
         // Express the balance as a change of the camera's white balance (linear sensor gains).
         Rgb m{linearRatioOfEncodedGain(bal[0] / bal[1], st.transfer), 1.0,
               linearRatioOfEncodedGain(bal[2] / bal[1], st.transfer)};
@@ -436,6 +535,72 @@ CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d
         out.saturation = static_cast<float>(cur.saturation * d.saturation);
     out.clamp();
     return out;
+}
+
+LevelPlan planAutoLevel(double stops, double currentAv, int currentDb, bool irisUsable, bool extended,
+                        double trimStops, int dbStep)
+{
+    dbStep = std::max(1, dbStep);
+    LevelPlan plan;
+    plan.irisAv = currentAv;
+    plan.gainDb = currentDb;
+    double rem = stops;
+    if (std::fabs(stops) < trimStops) {
+        plan.residualStops = stops;
+        return plan;
+    }
+    const bool iris = irisUsable && currentAv >= 0.0;
+    // Move the gain toward @p target (dB), at most by what is still needed (same sign only).
+    const auto useDb = [&](int target) {
+        const double room = (target - plan.gainDb) / 6.02;
+        if (std::fabs(rem) < 0.05 || room * rem <= 0.0)
+            return;
+        const double take = rem > 0 ? std::min(rem, room) : std::max(rem, room);
+        const int nd = static_cast<int>(std::lround((plan.gainDb + take * 6.02) / dbStep)) * dbStep;
+        if ((nd - plan.gainDb) * rem <= 0)
+            return; // less than one gain step: Gain Y trims it
+        rem -= (nd - plan.gainDb) / 6.02;
+        plan.gainDb = nd;
+    };
+    // Opening the iris (smaller Av) brightens: stops = currentAv - newAv.
+    const auto useIris = [&](double targetAv) {
+        if (!iris)
+            return;
+        const double room = plan.irisAv - targetAv;
+        if (std::fabs(rem) < 0.05 || room * rem <= 0.0)
+            return;
+        const double take = rem > 0 ? std::min(rem, room) : std::max(rem, room);
+        plan.irisAv -= take;
+        rem -= take;
+    };
+    if (stops > 0) {
+        useDb(0);      // negative gain costs dynamic range: back to 0 first
+        useIris(2.0);  // f/2
+        useDb(12);
+        useIris(1.0);  // f/1.4 (the lens clamps at its maximum aperture)
+        useDb(extended ? 36 : 24);
+    } else {
+        useDb(0);      // less gain = less noise
+        useIris(7.0);  // f/11
+        if (extended)
+            useIris(8.0); // f/16 (diffraction)
+    }
+    plan.appliedStops = stops - rem;
+    plan.residualStops = rem;
+    if (!iris)
+        plan.irisAv = currentAv;
+    return plan;
+}
+
+bool irisResponded(double meanBefore, double meanAfter, double expectedIrisStops, double otherStops,
+                   Transfer transfer)
+{
+    if (std::fabs(expectedIrisStops) < 0.25 || meanBefore <= 0.01 || meanAfter <= 0.01)
+        return true; // too small / too dark to tell
+    const double measured = std::log2(decode(meanAfter, transfer) / std::max(1e-6, decode(meanBefore, transfer)));
+    const double fromIris = measured - otherStops;
+    // the lens followed if at least a quarter of the expected change shows up, in the expected direction
+    return fromIris * expectedIrisStops > 0.0 && std::fabs(fromIris) >= 0.25 * std::fabs(expectedIrisStops);
 }
 
 QStringList sanityWarnings(const CameraCorrectionBundle &cur, const CameraCorrectionBundle &p)

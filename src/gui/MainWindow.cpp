@@ -478,13 +478,21 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     cameraLayout->addLayout(paramRow);
     paramRow = new QHBoxLayout();
     m_balanceViaCombo = new QComboBox(m_cameraPanel);
-    m_balanceViaCombo->addItem(QStringLiteral("цвет через CC Gain"), 0);
+    m_balanceViaCombo->addItem(QStringLiteral("цвет: авто"), 3);
     m_balanceViaCombo->addItem(QStringLiteral("цвет через ББ (K/tint)"), 1);
+    m_balanceViaCombo->addItem(QStringLiteral("цвет через CC Gain"), 0);
+    m_balanceViaCombo->setItemData(0, QStringLiteral("Авто: основной оттенок — балансом белого камеры (K/tint), "
+                                                     "остаток — CC Gain R/G/B"), Qt::ToolTipRole);
     paramRow->addWidget(m_balanceViaCombo);
     m_exposureViaCombo = new QComboBox(m_cameraPanel);
+    m_exposureViaCombo->addItem(QStringLiteral("уровень: авто"), 3);
     m_exposureViaCombo->addItem(QStringLiteral("уровень через CC Gain"), 0);
     m_exposureViaCombo->addItem(QStringLiteral("уровень через усиление dB"), 1);
     m_exposureViaCombo->addItem(QStringLiteral("уровень через диафрагму"), 2);
+    m_exposureViaCombo->setItemData(0, QStringLiteral("Авто: сначала свет — диафрагма (f/2…f/11), затем усиление dB "
+                                                      "(как можно ниже), CC Gain Y только для точной подстройки. "
+                                                      "При пересвете — прикрыть диафрагму / снизить усиление."),
+                                    Qt::ToolTipRole);
     paramRow->addWidget(m_exposureViaCombo);
     m_targetIreSpin = new QDoubleSpinBox(m_cameraPanel);
     m_targetIreSpin->setRange(20.0, 70.0);
@@ -2103,6 +2111,16 @@ int MainWindow::sendProposals(const QVector<int> &chosen, QString *errorsOut)
                                                       QString::fromUtf8(QJsonDocument(previous.toJson())
                                                                             .toJson(QJsonDocument::Compact)));
             }
+            if (camera.proposed.irisFStopAv >= 0.0f && camera.current.irisFStopAv >= 0.0f
+                && std::fabs(camera.proposed.irisFStopAv - camera.current.irisFStopAv) >= 0.25f
+                && camera.lastMeanLuma > 0.0) {
+                camera.irisProbePending = true;
+                camera.irisProbeExpectStops = camera.current.irisFStopAv - camera.proposed.irisFStopAv;
+                camera.irisProbeMeanBefore = camera.lastMeanLuma;
+                camera.irisProbeAvBefore = camera.current.irisFStopAv;
+                camera.irisProbeDbBefore = camera.current.gainDb;
+                camera.irisProbeGainYBefore = std::max(1e-3f, camera.current.gainY);
+            }
             camera.hasProposal = false; // applied: a new capture is needed for the next pass
             ++sent;
         }
@@ -2149,7 +2167,8 @@ void MainWindow::fitComboPopup(QComboBox *combo)
     if (combo->view())
         combo->view()->setMinimumWidth(widest + 48);
     for (int i = 0; i < combo->count(); ++i)
-        combo->setItemData(i, combo->itemText(i), Qt::ToolTipRole);
+        if (combo->itemData(i, Qt::ToolTipRole).toString().isEmpty())
+            combo->setItemData(i, combo->itemText(i), Qt::ToolTipRole);
     combo->setToolTip(combo->currentText());
     combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
     combo->setMinimumContentsLength(std::max(combo->minimumContentsLength(), 8));
@@ -2221,6 +2240,17 @@ void MainWindow::continueAutoMatchLoop()
         finishAutoMatchLoop(QStringLiteral("выполнено %1 прохода").arg(applied));
         return;
     }
+    // Sensor gain / iris / white balance need longer to show up in the captured picture than CC values
+    // (live test: +25 dB was not yet visible after 0.8 s and the next pass over-corrected).
+    bool lightChanged = false;
+    for (int i : toApply) {
+        const CameraRow &c = m_cameras.at(i);
+        lightChanged = lightChanged || c.proposed.gainDb != c.current.gainDb
+                       || std::fabs(c.proposed.irisFStopAv - c.current.irisFStopAv) > 0.01f
+                       || c.proposed.whiteBalanceKelvin != c.current.whiteBalanceKelvin
+                       || c.proposed.whiteBalanceTint != c.current.whiteBalanceTint;
+    }
+    const int settleMs = lightChanged ? 3000 : 800;
     QString errors;
     const int sent = sendProposals(toApply, &errors);
     qCInfo(lcRoute).noquote() << QStringLiteral("auto loop pass %1 applied to %2 camera(s) %3")
@@ -2234,7 +2264,7 @@ void MainWindow::continueAutoMatchLoop()
     ++m_loopPass;
     setCaptureStatus(QStringLiteral("Авто-подгонка: проход %1 — ждём, пока камеры применят значения…").arg(m_loopPass));
     // Camera needs a moment to apply; then measure again.
-    QTimer::singleShot(800, this, [this] {
+    QTimer::singleShot(settleMs, this, [this] {
         if (m_loopPass <= 0 || m_closing.load())
             return;
         onCaptureAnalyze();
@@ -2632,7 +2662,9 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
             return;
         }
         QStringList notes = d.notes;
-        cam.proposed = MatchEngine::compose(cam.current, d, s, &notes);
+        MatchEngine::Settings sc = s;
+        sc.irisUsable = !cam.irisUnresponsive;
+        cam.proposed = MatchEngine::compose(cam.current, d, sc, &notes);
         cam.notes << notes;
         cam.errBefore = d.rmsBeforeIre;
         cam.errAfter = d.rmsAfterIre;
@@ -2705,6 +2737,28 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                                          .arg(signal[i].noSignal ? QStringLiteral("NO-SIGNAL")
                                                                  : (signal[i].lowLight ? QStringLiteral("low-light")
                                                                                        : QStringLiteral("ok")));
+        if (cam.irisProbePending && !signal[i].noSignal) {
+            cam.irisProbePending = false;
+            const bool accepted = cam.current.irisFStopAv >= 0.0f
+                                  && std::fabs(cam.current.irisFStopAv - cam.irisProbeAvBefore) > 0.1;
+            const double otherStops =
+                (cam.current.gainDb - cam.irisProbeDbBefore) / 6.02
+                + std::log2(std::max(1e-3, static_cast<double>(cam.current.gainY) / cam.irisProbeGainYBefore)) / 0.45;
+            const bool followed = accepted
+                                  && MatchEngine::irisResponded(cam.irisProbeMeanBefore, signal[i].meanLuma,
+                                                                cam.irisProbeExpectStops, otherStops);
+            qCInfo(lcRoute).noquote() << QStringLiteral("iris probe %1 expect %2 st accepted=%3 followed=%4")
+                                             .arg(cam.binding.label)
+                                             .arg(cam.irisProbeExpectStops, 0, 'f', 2)
+                                             .arg(accepted)
+                                             .arg(followed);
+            if (!followed) {
+                cam.irisUnresponsive = true;
+                cam.notes << QStringLiteral("диафрагма не реагирует (объектив без управления?) — дальше уровень "
+                                            "через усиление");
+            }
+        }
+        cam.lastMeanLuma = signal[i].noSignal ? -1.0 : signal[i].meanLuma;
         if (signal[i].noSignal) {
             cam.notes << signal[i].reason;
             cam.lastFrame = QImage();
@@ -2781,6 +2835,16 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                     sm.lift = sm.gamma = sm.saturation = false;
                     pre << QStringLiteral("лифт/гамма/насыщенность не подбираются: кадры разные — выделите общую "
                                           "область на эталоне и камере");
+                }
+                // Exposure first: when the frames differ by more than 2 stops (or the camera frame is
+                // dark), colour / tone statistics are unreliable - this pass corrects the level only.
+                const double expRatio = cs.p50Linear > 1e-5 ? refStats.p50Linear / cs.p50Linear : 1.0;
+                if (sm.exposure && (expRatio > 4.0 || expRatio < 0.25 || (signal[i].lowLight && !signal[refIndex].lowLight))
+                    && (sm.balance || sm.lift || sm.gamma || sm.saturation)) {
+                    sm.balance = sm.lift = sm.gamma = sm.saturation = false;
+                    pre << QStringLiteral("сначала уровень: кадр %1 — цвет и тон на следующем проходе")
+                               .arg(signal[i].lowLight && !signal[refIndex].lowLight ? QStringLiteral("тёмный")
+                                                       : QStringLiteral("отличается от эталона более чем на 2 ступени"));
                 }
                 const MatchEngine::ReferenceMatch rm = MatchEngine::referenceMatch(cs, refStats, sm, &pre);
                 MatchEngine::Settings s2 = sm;
@@ -3089,12 +3153,14 @@ MatchEngine::Settings MainWindow::engineSettings() const
     s.lift = m_chkFitLift && m_chkFitLift->isChecked();
     s.gamma = m_chkFitGamma && m_chkFitGamma->isChecked();
     s.saturation = m_chkFitSat && m_chkFitSat->isChecked();
-    s.balanceVia = (m_balanceViaCombo && m_balanceViaCombo->currentData().toInt() == 1)
-                       ? MatchEngine::BalanceVia::WhiteBalance
-                       : MatchEngine::BalanceVia::CcGain;
-    const int ev = m_exposureViaCombo ? m_exposureViaCombo->currentData().toInt() : 0;
-    s.exposureVia = ev == 1 ? MatchEngine::ExposureVia::SensorGain
-                            : (ev == 2 ? MatchEngine::ExposureVia::Iris : MatchEngine::ExposureVia::CcGain);
+    const int bv = m_balanceViaCombo ? m_balanceViaCombo->currentData().toInt() : 3;
+    s.balanceVia = bv == 1 ? MatchEngine::BalanceVia::WhiteBalance
+                           : (bv == 0 ? MatchEngine::BalanceVia::CcGain : MatchEngine::BalanceVia::Auto);
+    const int ev = m_exposureViaCombo ? m_exposureViaCombo->currentData().toInt() : 3;
+    s.exposureVia = ev == 1   ? MatchEngine::ExposureVia::SensorGain
+                    : ev == 2 ? MatchEngine::ExposureVia::Iris
+                    : ev == 0 ? MatchEngine::ExposureVia::CcGain
+                              : MatchEngine::ExposureVia::Auto;
     s.strength = (m_strengthSpin ? m_strengthSpin->value() : 100) / 100.0;
     // per-pass limits (the closed loop converges); off in the test mode «Без ограничений»
     s.liveLimits = !unlimitedMode();
@@ -3127,8 +3193,15 @@ void MainWindow::loadEngineSettings()
         if (i >= 0)
             c->setCurrentIndex(i);
     };
-    setCombo(m_balanceViaCombo, v("balanceVia", 0).toInt());
-    setCombo(m_exposureViaCombo, v("exposureVia", 0).toInt());
+    // «Авто» (3) is the default; settings saved before it existed are switched to it once.
+    const bool autoMigrated = v("autoMethodsV1", false).toBool();
+    setCombo(m_balanceViaCombo, autoMigrated ? v("balanceVia", 3).toInt() : 3);
+    setCombo(m_exposureViaCombo, autoMigrated ? v("exposureVia", 3).toInt() : 3);
+    if (!autoMigrated) {
+        AtemAppSettings::setValue(QStringLiteral("match/autoMethodsV1"), true);
+        AtemAppSettings::setValue(QStringLiteral("match/balanceVia"), 3);
+        AtemAppSettings::setValue(QStringLiteral("match/exposureVia"), 3);
+    }
     setCombo(m_chartCombo, v("chart", QStringLiteral("cc24")).toString());
     setCombo(m_sampleTargetCombo, v("sampleTarget", QStringLiteral("reference")).toString());
     if (m_strengthSpin) {

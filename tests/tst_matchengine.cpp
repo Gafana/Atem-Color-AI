@@ -141,6 +141,10 @@ private Q_SLOTS:
     void referenceMatchDifferentScenesConverges();
     void liveLimitsBoundOnePass();
     void unlimitedModeTakesFullStep();
+    void autoLevelPlanOrder();
+    void autoComposeMovesLevelIntoLight();
+    void autoColourUsesWhiteBalanceThenCc();
+    void irisRespondedDetectsDeadLens();
 };
 
 void TestMatchEngine::deltaE2000Reference()
@@ -533,6 +537,128 @@ void TestMatchEngine::unlimitedModeTakesFullStep()
     QVERIFY(lvFull > lvLimited * 1.5);
     QCOMPARE(limited.saturation, 1.15);
     QVERIFY(std::fabs(full.saturation - 2.0) < 1e-9);
+}
+
+void TestMatchEngine::autoLevelPlanOrder()
+{
+    using MatchEngine::planAutoLevel;
+    // +2 stops at f/5.6 (Av 5), 0 dB: iris only
+    auto p = planAutoLevel(2.0, 5.0, 0, true, false);
+    QVERIFY(std::fabs(p.irisAv - 3.0) < 1e-6);
+    QCOMPARE(p.gainDb, 0);
+    // +4 stops: iris to f/2 (3 stops), then +6 dB
+    p = planAutoLevel(4.0, 5.0, 0, true, false);
+    QVERIFY(std::fabs(p.irisAv - 2.0) < 1e-6);
+    QCOMPARE(p.gainDb, 6);
+    // -2 stops at +12 dB: reduce the gain first (noise), iris untouched
+    p = planAutoLevel(-2.0, 4.0, 12, true, false);
+    QCOMPARE(p.gainDb, 0);
+    QVERIFY(std::fabs(p.irisAv - 4.0) < 1e-6);
+    // -3 stops at 0 dB, f/4: close the iris
+    p = planAutoLevel(-3.0, 4.0, 0, true, false);
+    QVERIFY(std::fabs(p.irisAv - 7.0) < 1e-6);
+    QCOMPARE(p.gainDb, 0);
+    // lens not controllable: gain instead
+    p = planAutoLevel(1.0, 5.0, 0, false, false);
+    QCOMPARE(p.gainDb, 6);
+    QVERIFY(std::fabs(p.irisAv - 5.0) < 1e-6);
+    // tiny change: Gain Y trim only
+    p = planAutoLevel(0.1, 5.0, 0, true, false);
+    QVERIFY(std::fabs(p.irisAv - 5.0) < 1e-6);
+    QCOMPARE(p.gainDb, 0);
+    QVERIFY(std::fabs(p.residualStops - 0.1) < 1e-9);
+    // exhausted range: the rest stays as residual for Gain Y
+    p = planAutoLevel(10.0, 2.0, 24, true, false);
+    QVERIFY(p.residualStops > 0.5);
+}
+
+void TestMatchEngine::autoComposeMovesLevelIntoLight()
+{
+    // Gain Y pushed by an earlier pass + the picture still 1 stop too dark: auto puts it all into the iris.
+    CameraCorrectionBundle cur;
+    cur.gainY = 1.33f;
+    cur.irisFStopAv = 5.0f;
+    cur.gainDb = 0;
+    MatchEngine::Delta d;
+    d.valid = true;
+    for (int c = 0; c < 3; ++c) {
+        d.ch[c].gain = std::pow(2.0, 0.45); // ≈ +1 stop
+        d.ch[c].lift = -0.05;               // fitted on the dark picture: held until the level is right
+    }
+    MatchEngine::Settings st;
+    st.exposureVia = MatchEngine::ExposureVia::Auto;
+    st.lift = true;
+    QStringList notes;
+    const CameraCorrectionBundle out = MatchEngine::compose(cur, d, st, &notes);
+    QCOMPARE(out.liftY, cur.liftY);
+    for (int c = 0; c < 3; ++c)
+        d.ch[c].lift = 0.0;
+    qInfo() << "auto level" << out.irisFStopAv << out.gainDb << out.gainY << notes;
+    QVERIFY(out.irisFStopAv < 3.4f && out.irisFStopAv > 2.6f); // ≈ 2 stops opened (1 + Gain Y 1.33 ≈ 0.9)
+    QCOMPARE(out.gainDb, 0);
+    QVERIFY(std::fabs(out.gainY - 1.0f) < 0.05f);
+    // overexposed: close the iris / lower gain instead of lowering Gain Y
+    CameraCorrectionBundle hot;
+    hot.irisFStopAv = 3.0f;
+    hot.gainDb = 6;
+    for (int c = 0; c < 3; ++c)
+        d.ch[c].gain = std::pow(0.25, 0.45); // ≈ -2 stops
+    const CameraCorrectionBundle down = MatchEngine::compose(hot, d, st, &notes);
+    qInfo() << "auto level down" << down.irisFStopAv << down.gainDb << down.gainY;
+    QCOMPARE(down.gainDb, 0);
+    QVERIFY(down.irisFStopAv > 3.3f); // the rest of the darkening comes from the iris
+    QVERIFY(std::fabs(down.gainY - 1.0f) < 0.05f);
+    // dead lens: gain only
+    st.irisUsable = false;
+    for (int c = 0; c < 3; ++c)
+        d.ch[c].gain = std::pow(2.0, 0.45);
+    CameraCorrectionBundle dead;
+    dead.irisFStopAv = 5.0f;
+    const CameraCorrectionBundle g = MatchEngine::compose(dead, d, st, &notes);
+    QCOMPARE(g.irisFStopAv, 5.0f);
+    QVERIFY2(g.gainDb >= 4 && g.gainDb <= 7, qPrintable(QString::number(g.gainDb))); // ≈ +1 stop of gain
+}
+
+void TestMatchEngine::autoColourUsesWhiteBalanceThenCc()
+{
+    // Strong warm cast: auto moves it into the camera white balance; the residual R/B gains stay small.
+    MatchEngine::Delta d;
+    d.valid = true;
+    d.ch[0].gain = 0.80;
+    d.ch[1].gain = 1.0;
+    d.ch[2].gain = 1.25;
+    CameraCorrectionBundle cur;
+    cur.whiteBalanceKelvin = 5600;
+    MatchEngine::Settings st;
+    st.exposure = false;
+    st.balanceVia = MatchEngine::BalanceVia::Auto;
+    QStringList notes;
+    const CameraCorrectionBundle out = MatchEngine::compose(cur, d, st, &notes);
+    qInfo() << "auto colour" << out.whiteBalanceKelvin << out.whiteBalanceTint << out.gainR << out.gainG << out.gainB
+            << notes;
+    QVERIFY(out.whiteBalanceKelvin < 5100); // warmer picture is cooled by a lower camera Kelvin setting
+    QVERIFY(std::fabs(out.gainR / out.gainG - 1.0f) < 0.08f);
+    QVERIFY(std::fabs(out.gainB / out.gainG - 1.0f) < 0.08f);
+    // small cast: CC gain only
+    d.ch[0].gain = 1.01;
+    d.ch[2].gain = 0.99;
+    const CameraCorrectionBundle small = MatchEngine::compose(cur, d, st, &notes);
+    QCOMPARE(small.whiteBalanceKelvin, 5600);
+    QVERIFY(small.gainR > small.gainB);
+}
+
+void TestMatchEngine::irisRespondedDetectsDeadLens()
+{
+    // expected +1 stop from the iris; picture unchanged -> not followed
+    QVERIFY(!MatchEngine::irisResponded(0.30, 0.30, 1.0, 0.0));
+    // picture brighter by about a stop -> followed
+    QVERIFY(MatchEngine::irisResponded(0.30, 0.40, 1.0, 0.0));
+    // brighter only because of +6 dB gain -> iris did not follow
+    QVERIFY(!MatchEngine::irisResponded(0.30, 0.40, 1.0, 1.0));
+    // tiny changes are not judged
+    QVERIFY(MatchEngine::irisResponded(0.30, 0.30, 0.2, 0.0));
+    // live: f/1.0 -> f/1.25 (0.33 stop) on a lens that does not follow
+    QVERIFY(!MatchEngine::irisResponded(121.7 / 255, 121.6 / 255, -0.33, 0.0));
 }
 
 QTEST_MAIN(TestMatchEngine)

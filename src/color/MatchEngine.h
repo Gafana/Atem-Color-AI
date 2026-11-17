@@ -33,6 +33,7 @@ enum class BalanceVia
 {
     CcGain,       ///< colour correction RGB gain (8.2) - exact, predictable
     WhiteBalance, ///< camera white balance Kelvin / tint (1.2) - physically on the sensor
+    Auto,         ///< white balance K/tint for the bulk cast, RGB CC gain for the residual
 };
 
 enum class ExposureVia
@@ -40,6 +41,7 @@ enum class ExposureVia
     CcGain,     ///< colour correction gain (all channels)
     SensorGain, ///< video gain in dB (1.13)
     Iris,       ///< lens aperture (0.2), needs a lens with electronic iris
+    Auto,       ///< light first: iris (sensible range), then sensor gain dB (kept low), Gain Y only to trim
 };
 
 struct Settings
@@ -57,6 +59,8 @@ struct Settings
      *  camera white balance ±1000 K / tint ±10, exposure ±1 stop. When off (test mode «Без ограничений»)
      *  only the camera's own parameter ranges apply. */
     bool liveLimits = false;
+    /** Auto level may use the lens iris (false when the lens is not controllable / did not follow). */
+    bool irisUsable = true;
     ColorScience::Transfer transfer = ColorScience::Transfer::Bt709Oetf;
 };
 
@@ -91,6 +95,28 @@ Delta solve(const QVector<Pair> &pairs, const Settings &settings);
 /** New absolute camera values = current camera values composed with the delta. */
 CameraCorrectionBundle compose(const CameraCorrectionBundle &current, const Delta &delta,
                                const Settings &settings, QStringList *notes = nullptr);
+
+/** Auto exposure split: how a level change (in stops of light, + = brighter) is spread over the
+ *  lens iris and the sensor gain. Order when brightening: negative dB back to 0, iris open to f/2,
+ *  gain up to +12 dB, iris to f/1.4, gain up to +24 dB (+36 with @p extended). When darkening:
+ *  gain down to 0 dB (less noise), iris closed to f/11 (f/16 with @p extended). What is left
+ *  (and small changes below @p trimStops) stays for CC Gain Y. */
+struct LevelPlan
+{
+    double irisAv = -1;     ///< new aperture value (Av = log2 N²), -1 = unknown / unchanged
+    int gainDb = 0;
+    double appliedStops = 0;///< light change achieved by iris + gain
+    double residualStops = 0;
+};
+/** Micro Studio Camera 4K G2 applies sensor gain in 6 dB steps (live test: 18 = 21 dB, 24 = 25 = 27 dB). */
+LevelPlan planAutoLevel(double stops, double currentAv, int currentDb, bool irisUsable, bool extended,
+                        double trimStops = 0.2, int dbStep = 6);
+
+/** Did the lens follow an iris change? @p meanBefore / @p meanAfter are encoded mean lumas,
+ *  @p expectedIrisStops the expected brightening from the iris, @p otherStops the known change from
+ *  other controls (gain dB, Gain Y) between the two captures. */
+bool irisResponded(double meanBefore, double meanAfter, double expectedIrisStops, double otherStops,
+                   ColorScience::Transfer transfer = ColorScience::Transfer::Bt709Oetf);
 
 /** Human readable reasons why a proposed change looks suspicious (empty = looks sane). */
 QStringList sanityWarnings(const CameraCorrectionBundle &current, const CameraCorrectionBundle &proposed);

@@ -118,6 +118,13 @@ private:
         QStringList notes;
         QStringList warnings;
         double errBefore = 0, errAfter = 0, deBefore = -1, deAfter = -1;
+        double lastMeanLuma = -1;     ///< encoded mean luma of the last capture (signal check)
+        // Iris probe (auto level): after an iris change the next capture checks the lens followed.
+        bool irisProbePending = false;
+        double irisProbeExpectStops = 0, irisProbeMeanBefore = 0, irisProbeAvBefore = -1;
+        int irisProbeDbBefore = 0;
+        float irisProbeGainYBefore = 1.0f;
+        bool irisUnresponsive = false; ///< lens did not follow: auto level uses gain instead
     };
 
     void rebuildAtemAvailabilityUi();
