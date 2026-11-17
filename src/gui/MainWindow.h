@@ -23,6 +23,7 @@ class QLabel;
 class QLineEdit;
 class QPushButton;
 class QSpinBox;
+class QDoubleSpinBox;
 class QTableWidget;
 class ScopeDockManager;
 class QDockWidget;
@@ -119,6 +120,7 @@ private:
         QStringList warnings;
         double errBefore = 0, errAfter = 0, deBefore = -1, deAfter = -1;
         double lastMeanLuma = -1;     ///< encoded mean luma of the last capture (signal check)
+        bool lastLowLight = false;    ///< last capture was dark (auto loop until tolerance stops)
         // Iris probe (auto level): after an iris change the next capture checks the lens followed.
         bool irisProbePending = false;
         double irisProbeExpectStops = 0, irisProbeMeanBefore = 0, irisProbeAvBefore = -1;
@@ -233,6 +235,12 @@ private:
     QPushButton *m_btnCapture = nullptr;
     QPushButton *m_btnRollback = nullptr;
     QPushButton *m_btnLoop = nullptr;
+    QPushButton *m_btnLoopUntil = nullptr; ///< auto-fit until ΔE ≤ target (doubles as «Стоп»)
+    QDoubleSpinBox *m_loopTargetSpin = nullptr;
+    bool m_loopUntilTol = false;           ///< current loop runs until the tolerance
+    bool m_loopCancel = false;
+    int m_loopUntilMax = 20;               ///< safety: max passes in the tolerance loop
+    int m_loopStallPasses = 3;             ///< safety: stop after this many passes without improvement
     QLabel *m_corrDetails = nullptr;
     // Closed-loop matching: capture → apply → settle → re-measure, ΔE history per camera (atemId).
     int m_loopPass = 0; ///< 0 = off, otherwise number of the current measurement pass (1-based)

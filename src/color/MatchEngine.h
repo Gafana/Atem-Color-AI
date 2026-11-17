@@ -203,8 +203,12 @@ struct ReferenceMatch
  *  histograms are not comparable. Instead the colour of the light (white balance + tint), then the
  *  exposure (median / log-average level) and only then - if enabled - tone (lift/gamma from luma
  *  percentiles) and saturation (median chroma) are matched, each conservatively. */
+/** @p toneCamera / @p toneReference: optional whole-frame statistics for tone (lift/gamma), per-zone tint
+ *  and saturation when @p camera / @p reference describe a small marked zone (e.g. a white sheet: one
+ *  level, no shadows) - the zone then sets only white balance and level. */
 ReferenceMatch referenceMatch(const SceneStats &camera, const SceneStats &reference, const Settings &settings,
-                              QStringList *notes = nullptr);
+                              QStringList *notes = nullptr, const SceneStats *toneCamera = nullptr,
+                              const SceneStats *toneReference = nullptr);
 
 /** Automatic mode: pairs that neutralise the estimated illuminant and bring the scene key to
  *  @p targetGreyIre (mid-grey level, e.g. 41 IRE for 18 % grey through BT.709), protecting

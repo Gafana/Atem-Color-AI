@@ -148,6 +148,7 @@ private Q_SLOTS:
     void referenceMatchFixesWashedOutCamera();
     void sceneStatsZoneTint();
     void autoLevelTradesGainForIris();
+    void referenceMatchFixesTintedLiftAndWrongKelvin();
 };
 
 void TestMatchEngine::deltaE2000Reference()
@@ -742,6 +743,65 @@ void TestMatchEngine::autoLevelTradesGainForIris()
     // dead iris: nothing traded
     const MatchEngine::LevelPlan q = MatchEngine::planAutoLevel(0.0, 4.83, 36, false, true);
     QCOMPARE(q.gainDb, 36);
+}
+
+void TestMatchEngine::referenceMatchFixesTintedLiftAndWrongKelvin()
+{
+    // Live 17.11 23:45: CAM2 broken by hand - Lift Y -0.04, R -0.06, B +0.14 (x2 in SDK units),
+    // WB 6650K under ~4000K light: bluish, washed out. Must reach ΔE < 1.5 within 8 passes (the
+    // «Авто до допуска» loop) and improve every pass.
+    // A room-like scene: mostly neutral surfaces at many levels (walls, sheet, shadows) + a few colours.
+    Scene scene;
+    const Scene chart = chartScene();
+    const double greys[16] = {0.008, 0.015, 0.025, 0.04, 0.06, 0.08, 0.11, 0.15, 0.2, 0.26, 0.33, 0.42, 0.52, 0.63, 0.75, 0.88};
+    for (int i = 0; i < 24; ++i) {
+        if (i % 3 == 2) {
+            scene.patchesLinear << chart.patchesLinear[(i * 7) % 18];
+        } else {
+            const double g = greys[(i * 2 / 3) % 16];
+            scene.neutral << scene.patchesLinear.size();
+            scene.patchesLinear << Rgb{g, g, g};
+        }
+    }
+    SimCamera ref;
+    ref.lightKelvin = 4000;
+    ref.state.whiteBalanceKelvin = 4000;
+    SimCamera cam = ref;
+    cam.state.whiteBalanceKelvin = 6650;
+    cam.state.liftY = -0.08f;
+    cam.state.liftR = -0.12f;
+    cam.state.liftB = 0.28f;
+    MatchEngine::Settings st;
+    st.liveLimits = false;
+    st.lift = st.gamma = st.saturation = true;
+    const MatchEngine::SceneStats rs = MatchEngine::sceneStats(ref.render(scene), st.transfer);
+    const auto diff = [&] {
+        return MatchEngine::compareScenes(MatchEngine::sceneStats(cam.render(scene), st.transfer), rs, st.transfer);
+    };
+    const double de0 = diff().sceneDe;
+    QStringList log;
+    for (int pass = 0; pass < 8; ++pass) {
+        const MatchEngine::SceneStats cs = MatchEngine::sceneStats(cam.render(scene), st.transfer);
+        const MatchEngine::ReferenceMatch m = MatchEngine::referenceMatch(cs, rs, st);
+        MatchEngine::Settings s2 = st;
+        s2.saturation = false;
+        MatchEngine::Delta d = MatchEngine::solve(m.pairs, s2);
+        d.saturation = m.saturation;
+        cam.state = MatchEngine::compose(cam.state, d, st);
+        const MatchEngine::SceneDiff di = diff();
+        log << QStringLiteral("dE %1 (zones %2/%3/%4) lift %5/%6/%7/%8")
+                   .arg(di.sceneDe, 0, 'f', 2)
+                   .arg(di.zoneDe[0], 0, 'f', 1)
+                   .arg(di.zoneDe[2], 0, 'f', 1)
+                   .arg(di.zoneDe[4], 0, 'f', 1)
+                   .arg(cam.state.liftR, 0, 'f', 3)
+                   .arg(cam.state.liftG, 0, 'f', 3)
+                   .arg(cam.state.liftB, 0, 'f', 3)
+                   .arg(cam.state.liftY, 0, 'f', 3);
+    }
+    qInfo().noquote() << "tinted lift: dE" << de0 << "\n  " << log.join(QStringLiteral("\n  "));
+    QVERIFY(de0 > 5.0);
+    QVERIFY2(diff().sceneDe < 1.5, qPrintable(log.join(QStringLiteral("; "))));
 }
 
 QTEST_MAIN(TestMatchEngine)

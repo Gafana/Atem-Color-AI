@@ -603,6 +603,21 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     buttons->addWidget(m_btnCapture);
     buttons->addWidget(m_btnApply);
     buttons->addWidget(m_btnLoop);
+    m_btnLoopUntil = new QPushButton(QStringLiteral("Авто до допуска"), m_cameraPanel);
+    m_btnLoopUntil->setToolTip(QStringLiteral(
+        "Проходы повторяются, пока ΔE сцены не станет не больше допуска. Останавливается сама: допуск достигнут, "
+        "%1 проходов, %2 прохода без улучшения, тёмный кадр / нет сигнала; повторное нажатие — «Стоп».")
+                                   .arg(m_loopUntilMax)
+                                   .arg(m_loopStallPasses));
+    m_loopTargetSpin = new QDoubleSpinBox(m_cameraPanel);
+    m_loopTargetSpin->setRange(0.5, 10.0);
+    m_loopTargetSpin->setSingleStep(0.1);
+    m_loopTargetSpin->setDecimals(1);
+    m_loopTargetSpin->setPrefix(QStringLiteral("ΔE ≤ "));
+    m_loopTargetSpin->setValue(1.5);
+    m_loopTargetSpin->setToolTip(QStringLiteral("Допуск для «Авто до допуска» (ΔE2000 сцены против эталона)"));
+    buttons->addWidget(m_btnLoopUntil);
+    buttons->addWidget(m_loopTargetSpin);
     buttons->addWidget(m_btnRollback);
     cameraLayout->addLayout(buttons);
 
@@ -658,7 +673,19 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     connect(m_mapTable, &QTableWidget::itemChanged, this, &MainWindow::onMappingEdited);
     connect(m_btnCapture, &QPushButton::clicked, this, &MainWindow::onCaptureAnalyze);
     connect(m_btnApply, &QPushButton::clicked, this, &MainWindow::onApply);
-    connect(m_btnLoop, &QPushButton::clicked, this, &MainWindow::onAutoMatchLoop);
+    connect(m_btnLoop, &QPushButton::clicked, this, [this] {
+        m_loopUntilTol = false;
+        onAutoMatchLoop();
+    });
+    connect(m_btnLoopUntil, &QPushButton::clicked, this, [this] {
+        if (m_loopPass > 0) { // running: «Стоп»
+            m_loopCancel = true;
+            m_btnLoopUntil->setText(QStringLiteral("Останавливаю…"));
+            return;
+        }
+        m_loopUntilTol = true;
+        onAutoMatchLoop();
+    });
     connect(m_btnRollback, &QPushButton::clicked, this, [this] {
         if (!m_client || m_busy)
             return;
@@ -1573,7 +1600,9 @@ void MainWindow::setBusy(bool busy)
     if (m_btnRollback)
         m_btnRollback->setEnabled(!busy);
     if (m_btnLoop)
-        m_btnLoop->setEnabled(!busy);
+        m_btnLoop->setEnabled(!busy && m_loopPass <= 0);
+    if (m_btnLoopUntil)
+        m_btnLoopUntil->setEnabled(!busy || m_loopPass > 0); // stays clickable as «Стоп»
     if (m_btnConnect)
         m_btnConnect->setEnabled(!busy);
     if (m_mapTable)
@@ -2203,9 +2232,17 @@ void MainWindow::onAutoMatchLoop()
         QMessageBox box(this);
         box.setIcon(QMessageBox::Question);
         box.setWindowTitle(QStringLiteral("Авто-подгонка"));
-        box.setText(QStringLiteral("До %1 раз: захват → расчёт → применение к камерам «В подстройке» → повторный "
-                                   "замер. %2 «Откат» вернёт значения до начала.")
-                        .arg(m_loopMaxApplies)
+        box.setText((m_loopUntilTol
+                         ? QStringLiteral("Пока ΔE сцены > %1 (не больше %2 проходов, стоп после %3 проходов без "
+                                          "улучшения): захват → расчёт → применение к камерам «В подстройке» → "
+                                          "повторный замер.")
+                               .arg(m_loopTargetSpin ? m_loopTargetSpin->value() : 1.5, 0, 'f', 1)
+                               .arg(m_loopUntilMax)
+                               .arg(m_loopStallPasses)
+                         : QStringLiteral("До %1 раз: захват → расчёт → применение к камерам «В подстройке» → "
+                                          "повторный замер.")
+                               .arg(m_loopMaxApplies))
+                    + QStringLiteral(" %1 «Откат» вернёт значения до начала.")
                         .arg(unlimitedMode()
                                  ? QStringLiteral("Режим «Без ограничений»: поправки применяются целиком, "
                                                   "в том числе с предупреждениями.")
@@ -2219,10 +2256,16 @@ void MainWindow::onAutoMatchLoop()
             return;
     }
     m_loopHistory.clear();
+    m_loopCancel = false;
+    if (m_loopUntilTol && m_btnLoopUntil)
+        m_btnLoopUntil->setText(QStringLiteral("Стоп"));
     for (CameraRow &c : m_cameras)
         c.irisUnresponsive = false; // lens may have been switched to remote / replaced: probe again
     m_loopPass = 1;
-    qCInfo(lcRoute).noquote() << QStringLiteral("auto loop start mode=%1").arg(colorMatchModeLogName(m_tuningMode));
+    qCInfo(lcRoute).noquote() << QStringLiteral("auto loop start mode=%1 until=%2 target=%3")
+                                     .arg(colorMatchModeLogName(m_tuningMode))
+                                     .arg(m_loopUntilTol)
+                                     .arg(m_loopTargetSpin ? m_loopTargetSpin->value() : 1.5, 0, 'f', 1);
     onCaptureAnalyze();
     if (!m_busy) // capture refused (message already shown)
         finishAutoMatchLoop(QStringLiteral("захват не запущен"));
@@ -2231,26 +2274,68 @@ void MainWindow::onAutoMatchLoop()
 void MainWindow::continueAutoMatchLoop()
 {
     // Called after a measurement pass (proposals are fresh, ΔE before = measured mismatch now).
+    const double target = m_loopUntilTol && m_loopTargetSpin ? m_loopTargetSpin->value() : 1.0;
+    const int maxApplies = m_loopUntilTol ? m_loopUntilMax : m_loopMaxApplies;
+    const int applied = m_loopPass - 1;
+    if (m_loopCancel) {
+        finishAutoMatchLoop(QStringLiteral("остановлено кнопкой «Стоп»"));
+        return;
+    }
     QVector<int> toApply;
     double worst = 0.0;
+    QStringList progress, stalled;
     for (int i = 0; i < m_cameras.size(); ++i) {
         const CameraRow &c = m_cameras.at(i);
         if (!c.hasProposal)
             continue;
+        // dark: the first passes may be raising the level - stop only if it is still dark after two
+        if (m_loopUntilTol && (c.lastMeanLuma < 0.0 || (c.lastLowLight && applied >= 2))) {
+            finishAutoMatchLoop(QStringLiteral("%1: %2 — проверьте камеру и свет")
+                                    .arg(c.binding.label,
+                                         c.lastMeanLuma < 0.0 ? QStringLiteral("нет сигнала") : QStringLiteral("тёмный кадр")));
+            return;
+        }
         worst = std::max(worst, c.deBefore);
+        progress << QStringLiteral("%1 ΔE %2").arg(c.binding.label).arg(c.deBefore, 0, 'f', 2);
+        // no improvement over the last N passes (best of the last N not better than the best before)
+        const QVector<double> h = m_loopHistory.value(c.binding.atemId);
+        if (m_loopUntilTol && h.size() > m_loopStallPasses) {
+            const double bestBefore = *std::min_element(h.cbegin(), h.cend() - m_loopStallPasses);
+            const double bestRecent = *std::min_element(h.cend() - m_loopStallPasses, h.cend());
+            if (bestRecent > bestBefore * 0.97) {
+                stalled << c.binding.label;
+                continue;
+            }
+        }
         // test mode: apply even with sanity warnings, only unread camera values block it
         const bool allowed = unlimitedMode() ? c.currentOk : c.warnings.isEmpty();
-        if (allowed && c.deBefore > 1.0)
+        if (allowed && c.deBefore > target)
             toApply << i;
     }
-    const int applied = m_loopPass - 1;
+    if (m_loopUntilTol)
+        setCaptureStatus(QStringLiteral("Авто до допуска: проход %1, %2 (цель ΔE ≤ %3)")
+                             .arg(m_loopPass)
+                             .arg(progress.join(QStringLiteral(", ")))
+                             .arg(target, 0, 'f', 1));
     if (toApply.isEmpty()) {
-        finishAutoMatchLoop(worst <= 1.0 ? QStringLiteral("совпадение достигнуто (ΔE ≤ 1)")
-                                         : QStringLiteral("нечего применять"));
+        if (worst <= target)
+            finishAutoMatchLoop(QStringLiteral("допуск достигнут (ΔE ≤ %1)").arg(target, 0, 'f', 1));
+        else if (!stalled.isEmpty())
+            finishAutoMatchLoop(QStringLiteral("нет улучшения %1 прохода подряд (%2) — ΔE %3, допуск %4 не достигнут")
+                                    .arg(m_loopStallPasses)
+                                    .arg(stalled.join(QStringLiteral(", ")))
+                                    .arg(worst, 0, 'f', 1)
+                                    .arg(target, 0, 'f', 1));
+        else
+            finishAutoMatchLoop(QStringLiteral("нечего применять"));
         return;
     }
-    if (applied >= m_loopMaxApplies) {
-        finishAutoMatchLoop(QStringLiteral("выполнено %1 прохода").arg(applied));
+    if (applied >= maxApplies) {
+        finishAutoMatchLoop(m_loopUntilTol ? QStringLiteral("достигнут предел %1 проходов — ΔE %2, допуск %3 не достигнут")
+                                                 .arg(applied)
+                                                 .arg(worst, 0, 'f', 1)
+                                                 .arg(target, 0, 'f', 1)
+                                           : QStringLiteral("выполнено %1 прохода").arg(applied));
         return;
     }
     // Sensor gain / iris / white balance need longer to show up in the captured picture than CC values
@@ -2280,6 +2365,10 @@ void MainWindow::continueAutoMatchLoop()
     QTimer::singleShot(settleMs, this, [this] {
         if (m_loopPass <= 0 || m_closing.load())
             return;
+        if (m_loopCancel) {
+            finishAutoMatchLoop(QStringLiteral("остановлено кнопкой «Стоп»"));
+            return;
+        }
         onCaptureAnalyze();
         if (!m_busy)
             finishAutoMatchLoop(QStringLiteral("захват не запущен"));
@@ -2291,6 +2380,13 @@ void MainWindow::finishAutoMatchLoop(const QString &why)
     if (m_loopPass <= 0)
         return;
     m_loopPass = 0;
+    m_loopCancel = false;
+    if (m_btnLoopUntil) {
+        m_btnLoopUntil->setText(QStringLiteral("Авто до допуска"));
+        m_btnLoopUntil->setEnabled(!m_busy);
+    }
+    if (m_btnLoop)
+        m_btnLoop->setEnabled(!m_busy);
     QStringList parts;
     for (const CameraRow &c : m_cameras) {
         const QVector<double> h = m_loopHistory.value(c.binding.atemId);
@@ -2786,6 +2882,7 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
             }
         }
         cam.lastMeanLuma = signal[i].noSignal ? -1.0 : signal[i].meanLuma;
+        cam.lastLowLight = !signal[i].noSignal && signal[i].lowLight;
         if (signal[i].noSignal) {
             cam.notes << signal[i].reason;
             cam.lastFrame = QImage();
@@ -2834,10 +2931,11 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
             const QRect r = zoneMode ? roiRect(c.lastFrame, c.grayRoi) : QRect();
             return r.isEmpty() ? c.lastFrame : c.lastFrame.copy(r);
         };
-        MatchEngine::SceneStats refStats;
+        MatchEngine::SceneStats refStats, refFull;
         if (m_tuningMode == ColorMatchMode::ReferenceCamera && !m_cameras.at(refIndex).lastFrame.isNull()) {
             QStringList refNotes;
             refStats = MatchEngine::sceneStats(roiImage(m_cameras.at(refIndex)), st.transfer, &refNotes);
+            refFull = MatchEngine::sceneStats(m_cameras.at(refIndex).lastFrame, st.transfer);
             if (!refStats.valid)
                 failures << QStringLiteral("Кадр эталонной камеры непригоден: %1").arg(refNotes.join(QStringLiteral("; ")));
         } else if (m_tuningMode == ColorMatchMode::ReferenceFrame && !m_referenceFrameImage.isNull()) {
@@ -2857,12 +2955,18 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                 MatchEngine::Settings sm = st;
                 const bool commonRegion = m_tuningMode == ColorMatchMode::ReferenceCamera && !cam.grayRoi.isEmpty()
                                           && !m_cameras.at(refIndex).grayRoi.isEmpty();
-                if ((st.lift || st.gamma || st.saturation) && !commonRegion) {
-                    // Different framings: tone and saturation statistics describe the scene, not the camera.
-                    sm.lift = sm.gamma = sm.saturation = false;
-                    pre << QStringLiteral("лифт/гамма/насыщенность не подбираются: кадры разные — выделите общую "
-                                          "область на эталоне и камере");
-                }
+                // Tone (lift / gamma), per-zone tint and saturation: from the whole frames. A marked zone (live:
+                // a white sheet, 5 IRE of contrast, no shadows) sets only the light colour and the level; with a
+                // zone on one camera only it is ignored. Both cameras are expected to see a similar scene.
+                MatchEngine::SceneStats camFull;
+                const bool zoneUsed = commonRegion && refFull.valid;
+                if (zoneUsed)
+                    camFull = MatchEngine::sceneStats(cam.lastFrame, st.transfer);
+                if (m_tuningMode == ColorMatchMode::ReferenceCamera && !commonRegion
+                    && (!cam.grayRoi.isEmpty() || !m_cameras.at(refIndex).grayRoi.isEmpty()))
+                    pre << QStringLiteral("область отмечена только на одной камере — замер по всему кадру");
+                if (zoneUsed && (sm.lift || sm.gamma || sm.saturation))
+                    pre << QStringLiteral("область — для баланса и уровня; лифт/гамма/насыщенность — по всему кадру");
                 // Exposure first: when the frames differ by more than 2 stops (or the camera frame is
                 // dark), colour / tone statistics are unreliable - this pass corrects the level only.
                 const double expRatio = cs.p50Linear > 1e-5 ? refStats.p50Linear / cs.p50Linear : 1.0;
@@ -2874,7 +2978,9 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                                .arg(signal[i].lowLight && !refLow ? QStringLiteral("тёмный")
                                                        : QStringLiteral("отличается от эталона более чем на 2 ступени"));
                 }
-                const MatchEngine::ReferenceMatch rm = MatchEngine::referenceMatch(cs, refStats, sm, &pre);
+                const MatchEngine::ReferenceMatch rm = MatchEngine::referenceMatch(
+                    cs, refStats, sm, &pre, zoneUsed && camFull.valid ? &camFull : nullptr,
+                    zoneUsed && camFull.valid ? &refFull : nullptr);
                 MatchEngine::Settings s2 = sm;
                 s2.saturation = false; // saturation comes from the median-chroma ratio, not from pairs
                 MatchEngine::Delta d = MatchEngine::solve(rm.pairs, s2);
@@ -2882,8 +2988,15 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                     d.saturation = rm.saturation;
                 cam.notes << pre;
                 MatchEngine::SceneDiff sd;
-                if (commonRegion || m_tuningMode == ColorMatchMode::ReferenceFrame)
-                    sd = MatchEngine::compareScenes(cs, refStats, st.transfer);
+                if (m_tuningMode == ColorMatchMode::ReferenceCamera || m_tuningMode == ColorMatchMode::ReferenceFrame)
+                    sd = MatchEngine::compareScenes(zoneUsed && camFull.valid ? camFull : cs,
+                                                    zoneUsed && camFull.valid ? refFull : refStats, st.transfer);
+                if (sd.valid && zoneUsed && camFull.valid) {
+                    // the loop must see both: the zone (light colour) and the whole picture (tone)
+                    const MatchEngine::SceneDiff zd = MatchEngine::compareScenes(cs, refStats, st.transfer);
+                    if (zd.valid)
+                        sd.sceneDe = std::max(sd.sceneDe, zd.zoneDeMean);
+                }
                 if (sd.valid) {
                     cam.notes << QStringLiteral("кадр против эталона: ΔE зон %1 (тени %2, середина %3, света %4), "
                                                 "чёрное %5/%6 IRE, контраст %7/%8 IRE, насыщенность C* %9/%10")

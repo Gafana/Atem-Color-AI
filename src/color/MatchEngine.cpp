@@ -76,7 +76,7 @@ ChannelCurve fitCurve(const QVector<Sample> &s, bool fitLift, bool fitGamma)
     double wsum = 0.0;
     for (const Sample &k : s)
         wsum += k.w;
-    const double prior[3] = {1e-4 * wsum, 0.02 * wsum, 0.01 * wsum};
+    const double prior[3] = {1e-4 * wsum, 0.004 * wsum, 0.01 * wsum};
     auto model = [](const double *q, double x) {
         ChannelCurve cc;
         cc.gain = std::exp(q[0]);
@@ -523,12 +523,24 @@ CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d
     out.gainG = static_cast<float>(cur.gainG * bal[1]);
     out.gainB = static_cast<float>(cur.gainB * bal[2]);
     out.gainY = static_cast<float>(cur.gainY * levelForCc);
-    const double liftCommon = kLumaR * d.ch[0].lift + kLumaG * d.ch[1].lift + kLumaB * d.ch[2].lift;
+    // Lift composition. The delta curve acts on the picture the camera makes now: new(x) = delta(cur(x)),
+    // so the existing lift is scaled by the delta's channel gain: lift' = g2*lift + l2*(1 - lift). Adding
+    // lifts (lift + l2) made a strong existing lift GROW whenever the channel gain moved (live 17.11: wrong
+    // Kelvin + Lift B +0.28 -> the blue lift went up to +0.5 over 5 passes). Colour part only for R/G/B
+    // (Luma Mix keeps the level), the level part scales Lift Y.
+    double dl[3];
+    const double curLift[3] = {cur.liftR, cur.liftG, cur.liftB};
+    for (int c = 0; c < 3; ++c) {
+        const double colourGain = level > 1e-6 ? d.ch[c].gain / level : 1.0;
+        dl[c] = curLift[c] * (colourGain - 1.0) + d.ch[c].lift * (1.0 - curLift[c]);
+    }
+    const double liftCommon = kLumaR * dl[0] + kLumaG * dl[1] + kLumaB * dl[2];
     const double gammaCommon = kLumaR * d.ch[0].gamma + kLumaG * d.ch[1].gamma + kLumaB * d.ch[2].gamma;
-    out.liftR = static_cast<float>(cur.liftR + d.ch[0].lift - liftCommon);
-    out.liftG = static_cast<float>(cur.liftG + d.ch[1].lift - liftCommon);
-    out.liftB = static_cast<float>(cur.liftB + d.ch[2].lift - liftCommon);
-    out.liftY = static_cast<float>(cur.liftY + liftCommon);
+    const double yScale = cur.gainY > 1e-6f ? out.gainY / cur.gainY : 1.0;
+    out.liftR = static_cast<float>(cur.liftR + dl[0] - liftCommon);
+    out.liftG = static_cast<float>(cur.liftG + dl[1] - liftCommon);
+    out.liftB = static_cast<float>(cur.liftB + dl[2] - liftCommon);
+    out.liftY = static_cast<float>(cur.liftY * yScale + liftCommon);
     out.gammaR = static_cast<float>(cur.gammaR + d.ch[0].gamma - gammaCommon);
     out.gammaG = static_cast<float>(cur.gammaG + d.ch[1].gamma - gammaCommon);
     out.gammaB = static_cast<float>(cur.gammaB + d.ch[2].gamma - gammaCommon);
@@ -860,7 +872,6 @@ SceneStats sceneStats(const QImage &imageIn, Transfer transfer, QStringList *not
     st.p05Linear = q(0.05);
     st.p10Linear = q(0.10);
     st.p95Linear = q(0.95);
-    const double qz[4] = {q(0.02), q(0.30), q(0.70), q(0.98)};
 
     // Illuminant. Neutral surfaces (walls, grey/white objects) all share the chromaticity of the light,
     // so they form the densest compact cluster in log-chroma space (u = ln R/G, v = ln B/G) close to the
@@ -985,25 +996,86 @@ SceneStats sceneStats(const QImage &imageIn, Transfer transfer, QStringList *not
     st.illuminant = ill;
     st.neutralFraction = neutralFraction;
 
-    // Zone colours: near-neutral pixels (within 0.25 of the light in log-chroma) per tonal band.
+    // Zone colours per tonal band. Centred on the band's own median chromaticity (not on the light):
+    // a strongly tinted lift (live: Lift B +0.28 -> blue shadows) moves every shadow pixel far from
+    // the light colour, and a filter around the light then found nothing and fell back to the light -
+    // the shadow tint was never measured. Mean of the pixels within 0.2 of the band median.
     {
         const Rgb raw = st.illuminantRaw;
-        const double u0 = std::log(raw.r / raw.g), v0 = std::log(raw.b / raw.g);
-        double su[3] = {0, 0, 0}, sv[3] = {0, 0, 0}, sw[3] = {0, 0, 0};
+        // Bands by rank (not by luma thresholds): a picture with few distinct levels (a chart, flat walls)
+        // made a band empty and its colour silently fell back to the light colour.
+        std::sort(all.begin(), all.end(), [](const Px &a, const Px &b) { return a.y < b.y; });
+        const int na = all.size();
+        const int r0 = static_cast<int>(na * 0.02), r1 = static_cast<int>(na * 0.30), r2 = static_cast<int>(na * 0.70),
+                  r3 = static_cast<int>(na * 0.98);
+        int rank = -1;
+        const auto bandOf = [&](double) {
+            ++rank;
+            if (rank >= r0 && rank < r1)
+                return 0;
+            if (rank >= r1 && rank < r2)
+                return 1;
+            if (rank >= r2 && rank < r3)
+                return 2;
+            return -1;
+        };
+        const auto uvOf = [](const Rgb &lin, double *u, double *v) {
+            const double g = std::max(1e-5, lin.g);
+            *u = std::log(std::max(1e-5, lin.r) / g);
+            *v = std::log(std::max(1e-5, lin.b) / g);
+        };
+        QVector<double> bu[3], bv[3];
         for (const Px &p : all) {
-            int z = -1;
-            if (p.y >= qz[0] && p.y < qz[1])
-                z = 0;
-            else if (p.y >= qz[1] && p.y < qz[2])
-                z = 1;
-            else if (p.y >= qz[2] && p.y <= qz[3])
-                z = 2;
+            const int z = bandOf(p.y);
             if (z < 0)
                 continue;
-            const double g = std::max(1e-5, p.lin.g);
-            const double u = std::log(std::max(1e-5, p.lin.r) / g);
-            const double v = std::log(std::max(1e-5, p.lin.b) / g);
-            if ((u - u0) * (u - u0) + (v - v0) * (v - v0) > 0.25 * 0.25)
+            double u, v;
+            uvOf(p.lin, &u, &v);
+            bu[z] << u;
+            bv[z] << v;
+        }
+        double mu[3], mv[3];
+        for (int z = 0; z < 3; ++z) {
+            mu[z] = std::log(raw.r / raw.g);
+            mv[z] = std::log(raw.b / raw.g);
+            if (bu[z].size() >= 40) {
+                std::nth_element(bu[z].begin(), bu[z].begin() + bu[z].size() / 2, bu[z].end());
+                std::nth_element(bv[z].begin(), bv[z].begin() + bv[z].size() / 2, bv[z].end());
+                mu[z] = bu[z][bu[z].size() / 2];
+                mv[z] = bv[z][bv[z].size() / 2];
+            }
+        }
+        // window: 0.2 around the median, widened to the closest half of the band when that is empty
+        // (separate u / v medians can land between a few coloured clusters)
+        double rad2[3];
+        {
+            QVector<double> dist[3];
+            rank = -1;
+            for (const Px &p : all) {
+                const int z = bandOf(p.y);
+                if (z < 0)
+                    continue;
+                double u, v;
+                uvOf(p.lin, &u, &v);
+                dist[z] << (u - mu[z]) * (u - mu[z]) + (v - mv[z]) * (v - mv[z]);
+            }
+            for (int z = 0; z < 3; ++z) {
+                rad2[z] = 0.2 * 0.2;
+                if (dist[z].size() >= 40) {
+                    std::nth_element(dist[z].begin(), dist[z].begin() + dist[z].size() / 2, dist[z].end());
+                    rad2[z] = std::max(rad2[z], dist[z][dist[z].size() / 2]);
+                }
+            }
+        }
+        double su[3] = {0, 0, 0}, sv[3] = {0, 0, 0}, sw[3] = {0, 0, 0};
+        rank = -1;
+        for (const Px &p : all) {
+            const int z = bandOf(p.y);
+            if (z < 0)
+                continue;
+            double u, v;
+            uvOf(p.lin, &u, &v);
+            if ((u - mu[z]) * (u - mu[z]) + (v - mv[z]) * (v - mv[z]) > rad2[z])
                 continue;
             const double w = z == 0 ? 1.0 : p.y;
             su[z] += w * u;
@@ -1058,8 +1130,12 @@ SceneStats sceneStats(const QImage &imageIn, Transfer transfer, QStringList *not
     return st;
 }
 
-ReferenceMatch referenceMatch(const SceneStats &cam, const SceneStats &ref, const Settings &st, QStringList *notes)
+ReferenceMatch referenceMatch(const SceneStats &cam, const SceneStats &ref, const Settings &st, QStringList *notes,
+                              const SceneStats *toneCamera, const SceneStats *toneReference)
 {
+    const bool separateTone = toneCamera && toneReference && toneCamera->valid && toneReference->valid;
+    const SceneStats &tc = separateTone ? *toneCamera : cam;
+    const SceneStats &tr = separateTone ? *toneReference : ref;
     ReferenceMatch out;
     if (!cam.valid || !ref.valid)
         return out;
@@ -1106,16 +1182,23 @@ ReferenceMatch referenceMatch(const SceneStats &cam, const SceneStats &ref, cons
             double c, r, w;
             int zone;
         };
-        const Q qs[] = {{cam.p02Linear, ref.p02Linear, 1.0, 0}, {cam.p05Linear, ref.p05Linear, 1.0, 0},
-                        {cam.p10Linear, ref.p10Linear, 0.8, 0}, {cam.p25Linear, ref.p25Linear, 0.6, 0},
-                        {cam.p50Linear, ref.p50Linear, 0.6, 1}, {cam.p75Linear, ref.p75Linear, 0.6, 2},
-                        {cam.p90Linear, ref.p90Linear, 0.6, 2}, {cam.p98Linear, ref.p98Linear, 0.4, 2}};
+        const Q qs[] = {{tc.p02Linear, tr.p02Linear, 1.0, 0}, {tc.p05Linear, tr.p05Linear, 1.0, 0},
+                        {tc.p10Linear, tr.p10Linear, 0.8, 0}, {tc.p25Linear, tr.p25Linear, 0.6, 0},
+                        {tc.p50Linear, tr.p50Linear, 0.6, 1}, {tc.p75Linear, tr.p75Linear, 0.6, 2},
+                        {tc.p90Linear, tr.p90Linear, 0.6, 2}, {tc.p98Linear, tr.p98Linear, 0.4, 2}};
+        // whole-frame tone with the level from the zone: keep the shape, rescale to the zone's exposure
+        const double toneRatio = tc.p50Linear > 1e-5 ? tr.p50Linear / tc.p50Linear : 1.0;
+        const double levelFix = separateTone && toneRatio > 1e-3 ? factor / toneRatio : 1.0;
+        const auto rel = [](const Rgb &a, const Rgb &b) { return Rgb{a.r / b.r, a.g / b.g, a.b / b.b}; };
         for (const Q &qq : qs) {
             if (qq.c <= 1e-5 || qq.r <= 1e-5 || qq.c >= 0.95 || qq.r >= 0.95)
                 continue;
-            const Rgb ci = cam.zoneIll[qq.zone];
-            const Rgb ri = st.balance ? ref.zoneIll[qq.zone] : ci;
-            const double tl = st.exposure ? qq.r : qq.c;
+            // zone tint relative to the frame's light, on top of the light colour measured on the zone
+            const Rgb zc = rel(tc.zoneIll[qq.zone], tc.illuminantRaw);
+            const Rgb zr = rel(tr.zoneIll[qq.zone], tr.illuminantRaw);
+            const Rgb ci{camIll.r * zc.r, camIll.g * zc.g, camIll.b * zc.b};
+            const Rgb ri = st.balance ? Rgb{wantIll.r * zr.r, wantIll.g * zr.g, wantIll.b * zr.b} : ci;
+            const double tl = st.exposure ? qq.r * levelFix : qq.c;
             Pair p;
             p.measured = encode(Rgb{ci.r * qq.c, ci.g * qq.c, ci.b * qq.c}, st.transfer);
             p.target = encode(Rgb{ri.r * tl, ri.g * tl, ri.b * tl}, st.transfer);
@@ -1128,14 +1211,14 @@ ReferenceMatch referenceMatch(const SceneStats &cam, const SceneStats &ref, cons
                                      "камеры видят похожую сцену");
     }
     // 4) saturation: CIELAB chroma of the colourful part of the picture (p75 / p90), exposure-normalised.
-    if (st.saturation && cam.chromaCount >= 200 && ref.chromaCount >= 200 && cam.chromaP75 > 2.0
-        && ref.chromaP75 > 2.0) {
-        const double r = std::sqrt((ref.chromaP75 / cam.chromaP75) * (ref.chromaP90 / std::max(1e-3, cam.chromaP90)));
+    if (st.saturation && tc.chromaCount >= 200 && tr.chromaCount >= 200 && tc.chromaP75 > 2.0
+        && tr.chromaP75 > 2.0) {
+        const double r = std::sqrt((tr.chromaP75 / tc.chromaP75) * (tr.chromaP90 / std::max(1e-3, tc.chromaP90)));
         out.saturation = st.liveLimits ? std::clamp(r, 0.85, 1.15) : std::clamp(r, 0.25, 4.0);
         if (notes)
             *notes << QStringLiteral("насыщенность: C* p75 %1 → эталон %2 (×%3)")
-                          .arg(cam.chromaP75, 0, 'f', 1)
-                          .arg(ref.chromaP75, 0, 'f', 1)
+                          .arg(tc.chromaP75, 0, 'f', 1)
+                          .arg(tr.chromaP75, 0, 'f', 1)
                           .arg(out.saturation, 0, 'f', 2);
     } else if (st.saturation && notes) {
         *notes << QStringLiteral("насыщенность не считается: мало цветных участков в кадре");
