@@ -152,6 +152,8 @@ private Q_SLOTS:
     void referenceMatchUnwindsLiftGammaPair();
     void sceneStatsChannelQuantiles();
     void referenceMatchUnwindsCcGainSkew();
+    void findWhiteSheetFindsSheet();
+    void autoLevelAlignsDbFirst();
 };
 
 void TestMatchEngine::deltaE2000Reference()
@@ -951,6 +953,57 @@ void TestMatchEngine::referenceMatchUnwindsCcGainSkew()
     QVERIFY2(std::fabs(cam.state.gainR / cam.state.gainG - 1.0) < 0.1, why.constData());
     QVERIFY2(std::fabs(cam.state.gainB / cam.state.gainG - 1.0) < 0.1, why.constData());
     QVERIFY2(std::abs(cam.state.whiteBalanceKelvin - 4000) <= 600, why.constData());
+}
+
+void TestMatchEngine::findWhiteSheetFindsSheet()
+{
+    // room-like frame: mid-grey noisy background, a saturated bright poster, a white sheet with a fold line
+    QImage img(640, 360, QImage::Format_RGB32);
+    quint32 seed = 7;
+    const auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return int(seed >> 27) - 16; };
+    for (int y = 0; y < 360; ++y)
+        for (int x = 0; x < 640; ++x) {
+            int v = 70 + rnd();
+            QRgb c = qRgb(v, v - 5, v - 10);
+            if (x >= 30 && x < 150 && y >= 40 && y < 200)
+                c = qRgb(120, 200, 90); // green poster
+            if (x >= 300 && x < 520 && y >= 60 && y < 320)
+                c = qRgb(205 + rnd() / 8, 208 + rnd() / 8, 212 + rnd() / 8); // sheet
+            if (x == 400 && y >= 60 && y < 320)
+                c = qRgb(150, 150, 150); // fold
+            img.setPixel(x, y, c);
+        }
+    QString why;
+    const QRectF r = MatchEngine::findWhiteSheet(img, &why);
+    qInfo() << "sheet" << r << why;
+    QVERIFY(!r.isEmpty());
+    const QRectF sheet(300 / 640.0, 60 / 360.0, 220 / 640.0, 260 / 360.0);
+    QVERIFY(sheet.contains(r));
+    QVERIFY(r.width() * r.height() > 0.15 * sheet.width() * sheet.height());
+}
+
+void TestMatchEngine::autoLevelAlignsDbFirst()
+{
+    // camera at 30 dB, reference at 24 dB, picture 0.6 stop too bright: dB to 24 first, the iris opens
+    // to make up the rest, nothing goes into a negative lift
+    CameraCorrectionBundle cur;
+    cur.gainDb = 30;
+    cur.irisFStopAv = 2.0f;
+    MatchEngine::Delta d;
+    d.valid = true;
+    const double enc = std::pow(std::pow(2.0, -0.6), 0.45); // BT.709 OETF slope above the knee
+    for (int c = 0; c < 3; ++c)
+        d.ch[c].gain = enc;
+    MatchEngine::Settings st;
+    st.liveLimits = false;
+    st.exposureVia = MatchEngine::ExposureVia::Auto;
+    st.alignDb = 24;
+    const CameraCorrectionBundle out = MatchEngine::compose(cur, d, st);
+    qInfo() << "dB first: gain" << out.gainDb << "Av" << out.irisFStopAv << "Gain Y" << out.gainY;
+    QCOMPARE(out.gainDb, 24);
+    // -6 dB = -1 stop, wanted ~-0.5 (encoded) -> the iris opens by ~0.5 stop
+    QVERIFY(out.irisFStopAv < 1.9f && out.irisFStopAv > 1.2f); // the rest of the -6 dB is made up by the iris
+    QVERIFY(std::fabs(out.gainY - 1.0f) < 0.05f);
 }
 
 QTEST_MAIN(TestMatchEngine)

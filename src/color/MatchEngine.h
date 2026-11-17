@@ -6,6 +6,8 @@
 
 #include <QImage>
 #include <QRect>
+#include <QRectF>
+#include <QString>
 #include <QStringList>
 #include <QVector>
 
@@ -75,7 +77,18 @@ struct Settings
      *  the reference's, ±25 % per pass), the white balance takes the rest. */
     bool unwindGain = false;
     double unwindGainRB[2] = {1.0, 1.0};
+    /** Exposure order (ExposureVia::Auto): when the sensor gain differs from this (the reference's dB) by a
+     *  whole step or more, the dB is aligned first, then the iris, then Gain Y. Live stress 7: a camera at
+     *  +12 dB was brought down by closing the iris and a negative Lift Y - noisy and with lifted blacks. */
+    int alignDb = kNoAlignDb;
+    /** The stats describe one uniform object (a white sheet zone): the level is its median ratio. */
+    bool objectZone = false;
+    static constexpr int kNoAlignDb = -1000;
 };
+
+/** Suggest a measurement zone on a white sheet / grey card in @p frame: the largest bright, near-neutral,
+ *  smooth area, shrunk to its interior. Returns a normalized rect (0..1) or an empty rect. */
+QRectF findWhiteSheet(const QImage &frame, QString *why = nullptr);
 
 /** Model of one channel of the camera primary grade on encoded signal x in [0,1]:
  *  y = (x*gain + lift*(1-x)) ^ (2^-gamma). Lift/gamma scale of the real camera is not documented
@@ -202,6 +215,7 @@ struct SceneDiff
     bool valid = false;
     double zoneDe[5] = {0, 0, 0, 0, 0}; ///< ΔE2000 of the zone colours at p5/p25/p50/p75/p95
     double zoneDeMean = 0;
+    double medianDe = 0;  ///< ΔE2000 of the median colour (object metric: a uniform sheet / card zone)
     double shadowIre[2] = {0, 0};       ///< p5 luma, camera / reference (IRE)
     double contrastIre[2] = {0, 0};     ///< p95 - p5 luma, camera / reference (IRE)
     double chroma75[2] = {0, 0};        ///< C* p75, camera / reference

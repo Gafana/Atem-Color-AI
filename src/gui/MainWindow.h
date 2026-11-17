@@ -109,6 +109,7 @@ private:
         bool includeInTuning = true;
         QImage lastFrame;
         QRectF grayRoi;
+        double loopDamp = 1.0; ///< auto loop step factor (halved after a pass that made ΔE worse)
         QVector<QPointF> checkerCorners;
         QVector<ColorCheckerPatch> checkerPatches;
         // MatchEngine result (relative to the values read from the camera before the calculation)
@@ -274,6 +275,7 @@ private:
     QLabel *m_refLabel = nullptr;
     QLabel *m_markLabel = nullptr;
     QPushButton *m_btnClearZone = nullptr;
+    QPushButton *m_btnFindSheet = nullptr;
     class QMenu *m_presetMenu = nullptr;
     bool m_atemWasConnected = false;
 

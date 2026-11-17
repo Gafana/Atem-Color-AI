@@ -387,8 +387,26 @@ CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d
         const double encTotal = level * (absorbY ? cur.gainY : 1.0);
         const double stops = std::log2(std::max(1e-6, linearRatioOfEncodedGain(encTotal, st.transfer)));
         const bool irisOk = st.irisUsable && cur.irisFStopAv >= 0.0f;
-        const LevelPlan plan = planAutoLevel(stops, irisOk ? cur.irisFStopAv : -1.0, cur.gainDb, irisOk,
-                                             !st.liveLimits);
+        LevelPlan plan = planAutoLevel(stops, irisOk ? cur.irisFStopAv : -1.0, cur.gainDb, irisOk, !st.liveLimits);
+        if (st.alignDb != Settings::kNoAlignDb && std::abs(st.alignDb - cur.gainDb) % 6 == 0
+            && std::fabs(stops - (st.alignDb - cur.gainDb) / 6.02) < 3.0) {
+            // the sensor gain stays at the reference's (planAutoLevel would trade it away again)
+            // dB first (same noise / black level as the reference), then the iris, then Gain Y
+            plan = LevelPlan{};
+            plan.gainDb = qBound(-12, st.alignDb, 36);
+            double rem = stops - (plan.gainDb - cur.gainDb) / 6.02;
+            plan.irisAv = cur.irisFStopAv;
+            if (irisOk && std::fabs(rem) > 0.1) {
+                const double av = std::clamp(cur.irisFStopAv - rem, 1.0, 8.0);
+                rem -= cur.irisFStopAv - av;
+                plan.irisAv = av;
+            }
+            plan.appliedStops = stops - rem;
+            plan.residualStops = rem;
+            if (notes && plan.gainDb != cur.gainDb)
+                *notes << QStringLiteral("усиление сначала выравнивается с эталоном: %1 → %2 dB")
+                              .arg(cur.gainDb).arg(plan.gainDb);
+        }
         if (plan.irisAv >= 0.0 && std::fabs(plan.irisAv - cur.irisFStopAv) > 1e-3)
             out.irisFStopAv = static_cast<float>(plan.irisAv);
         out.gainDb = plan.gainDb;
@@ -1193,7 +1211,11 @@ ReferenceMatch referenceMatch(const SceneStats &cam, const SceneStats &ref, cons
     if (st.exposure) {
         const double rm = cam.p50Linear > 1e-5 ? ref.p50Linear / cam.p50Linear : 1.0;
         const double rk = cam.keyLinear > 1e-5 ? ref.keyLinear / cam.keyLinear : 1.0;
-        factor = std::sqrt(std::max(1e-3, rm) * std::max(1e-3, rk));
+        factor = st.objectZone ? std::max(1e-3, rm) : std::sqrt(std::max(1e-3, rm) * std::max(1e-3, rk));
+        if (notes && st.objectZone)
+            *notes << QStringLiteral("уровень по объекту: медиана %1 → %2 (×%3), p98 %4")
+                          .arg(cam.p50Linear, 0, 'f', 3).arg(ref.p50Linear, 0, 'f', 3).arg(rm, 0, 'f', 2)
+                          .arg(cam.p98Linear, 0, 'f', 3);
         if (factor > 1.0 && cam.p98Linear * factor > 0.9) {
             factor = std::max(1.0, 0.9 / std::max(1e-6, cam.p98Linear));
             if (notes)
@@ -1320,6 +1342,13 @@ SceneDiff compareScenes(const SceneStats &cam, const SceneStats &ref, Transfer t
         sum += d.zoneDe[i];
     }
     d.zoneDeMean = sum / 5.0;
+    {
+        // the object itself (sheet / card): its median colour; the spread inside the zone (shading across
+        // the page, seen from another angle) is not a camera difference
+        const Rgb a = cam.zoneIll[1], b = ref.zoneIll[1];
+        d.medianDe = deltaE2000(linear709ToLabD65(Rgb{a.r * cam.p50Linear, a.g * cam.p50Linear, a.b * cam.p50Linear}),
+                                linear709ToLabD65(Rgb{b.r * ref.p50Linear, b.g * ref.p50Linear, b.b * ref.p50Linear}));
+    }
     d.shadowIre[0] = encode(cam.p05Linear, transfer) * 100.0;
     d.shadowIre[1] = encode(ref.p05Linear, transfer) * 100.0;
     d.contrastIre[0] = (encode(cam.p95Linear, transfer) - encode(cam.p05Linear, transfer)) * 100.0;
@@ -1382,6 +1411,129 @@ QVector<Pair> autoPairs(const QImage &imageIn, const Settings &st, double target
         est->neutralFraction = scene.neutralFraction;
     }
     return out;
+}
+
+
+QRectF findWhiteSheet(const QImage &frameIn, QString *why)
+{
+    if (frameIn.isNull()) {
+        if (why)
+            *why = QStringLiteral("нет кадра");
+        return {};
+    }
+    const int W = 192, H = 108;
+    const QImage img = frameIn.convertToFormat(QImage::Format_RGB32).scaled(W, H, Qt::IgnoreAspectRatio,
+                                                                           Qt::SmoothTransformation);
+    std::vector<double> y(W * H), sat(W * H), mx(W * H);
+    for (int j = 0; j < H; ++j) {
+        const QRgb *row = reinterpret_cast<const QRgb *>(img.constScanLine(j));
+        for (int i = 0; i < W; ++i) {
+            const double r = qRed(row[i]) / 255.0, g = qGreen(row[i]) / 255.0, b = qBlue(row[i]) / 255.0;
+            const int k = j * W + i;
+            y[k] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            mx[k] = std::max({r, g, b});
+            sat[k] = mx[k] > 1e-3 ? (mx[k] - std::min({r, g, b})) / mx[k] : 1.0;
+        }
+    }
+    std::vector<double> sorted = y;
+    std::sort(sorted.begin(), sorted.end());
+    const double top = sorted[std::min(sorted.size() - 1, sorted.size() * 995 / 1000)];
+    // bright (the sheet is the brightest large thing), not clipped, near-neutral, smooth (5x5 std: no
+    // text, edges or texture)
+    std::vector<uchar> m(W * H, 0);
+    for (int j = 2; j < H - 2; ++j)
+        for (int i = 2; i < W - 2; ++i) {
+            const int k = j * W + i;
+            if (y[k] < 0.75 * top || mx[k] >= 0.97 || sat[k] >= 0.2)
+                continue;
+            double s1 = 0, s2 = 0;
+            for (int dj = -2; dj <= 2; ++dj)
+                for (int di = -2; di <= 2; ++di) {
+                    const double v = y[k + dj * W + di];
+                    s1 += v;
+                    s2 += v * v;
+                }
+            const double mean = s1 / 25.0;
+            m[k] = std::sqrt(std::max(0.0, s2 / 25.0 - mean * mean)) < 0.02;
+        }
+    for (int it = 0; it < 2; ++it) {
+        std::vector<uchar> e(W * H, 0);
+        for (int j = 1; j < H - 1; ++j)
+            for (int i = 1; i < W - 1; ++i) {
+                const int k = j * W + i;
+                e[k] = m[k] && m[k - 1] && m[k + 1] && m[k - W] && m[k + W];
+            }
+        m.swap(e);
+    }
+    // largest 4-connected component
+    std::vector<int> label(W * H, -1);
+    int best = -1, bestSize = 0, id = 0;
+    std::vector<int> stack;
+    for (int k0 = 0; k0 < W * H; ++k0) {
+        if (!m[k0] || label[k0] >= 0)
+            continue;
+        int size = 0;
+        stack.assign(1, k0);
+        label[k0] = id;
+        while (!stack.empty()) {
+            const int p = stack.back();
+            stack.pop_back();
+            ++size;
+            const int px = p % W;
+            const int nb[4] = {px > 0 ? p - 1 : -1, px < W - 1 ? p + 1 : -1, p - W, p + W};
+            for (int q : nb)
+                if (q >= 0 && q < W * H && m[q] && label[q] < 0) {
+                    label[q] = id;
+                    stack.push_back(q);
+                }
+        }
+        if (size > bestSize) {
+            bestSize = size;
+            best = id;
+        }
+        ++id;
+    }
+    if (best < 0 || bestSize < W * H / 300) {
+        if (why)
+            *why = QStringLiteral("светлый нейтральный объект не найден");
+        return {};
+    }
+    // largest axis-aligned rectangle inside the component (histogram method)
+    std::vector<int> h(W, 0);
+    int bx = 0, by = 0, bw = 0, bh = 0;
+    for (int j = 0; j < H; ++j) {
+        for (int i = 0; i < W; ++i)
+            h[i] = label[j * W + i] == best ? h[i] + 1 : 0;
+        std::vector<std::pair<int, int>> st; // (start, height)
+        for (int i = 0; i <= W; ++i) {
+            const int cur = i < W ? h[i] : 0;
+            int start = i;
+            while (!st.empty() && st.back().second >= cur) {
+                start = st.back().first;
+                const int hh = st.back().second;
+                st.pop_back();
+                if (hh * (i - start) > bw * bh) {
+                    bx = start;
+                    by = j - hh + 1;
+                    bw = i - start;
+                    bh = hh;
+                }
+            }
+            st.push_back({start, cur});
+        }
+    }
+    const double mw = bw * 0.1, mh = bh * 0.1;
+    QRectF r((bx + mw) / W, (by + mh) / H, (bw - 2 * mw) / W, (bh - 2 * mh) / H);
+    if (r.width() < 0.02 || r.height() < 0.02) {
+        if (why)
+            *why = QStringLiteral("найденная область слишком мала");
+        return {};
+    }
+    if (why)
+        *why = QStringLiteral("лист: %1×%2 % кадра — проверьте, что область только на листе")
+                   .arg(r.width() * 100, 0, 'f', 0)
+                   .arg(r.height() * 100, 0, 'f', 0);
+    return r;
 }
 
 } // namespace MatchEngine

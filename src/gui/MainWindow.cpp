@@ -464,6 +464,31 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
         }
     });
     markRow->addWidget(m_btnClearZone);
+    m_btnFindSheet = new QPushButton(QStringLiteral("Найти лист"), m_cameraPanel);
+    m_btnFindSheet->setToolTip(QStringLiteral("Найти на последних кадрах всех камер белый лист / серую карту (самая большая "
+                                              "светлая нейтральная ровная область) и поставить туда область замера"));
+    connect(m_btnFindSheet, &QPushButton::clicked, this, [this] {
+        QStringList res;
+        for (CameraRow &camera : m_cameras) {
+            if (camera.lastFrame.isNull()) {
+                res << QStringLiteral("%1: нет кадра — сначала «Захват и расчёт»").arg(camera.binding.label);
+                continue;
+            }
+            QString why;
+            const QRectF r = MatchEngine::findWhiteSheet(camera.lastFrame, &why);
+            if (!r.isEmpty())
+                camera.grayRoi = r;
+            res << QStringLiteral("%1: %2").arg(camera.binding.label, why);
+            qCInfo(lcRoute).noquote() << QStringLiteral("find sheet %1 -> %2,%3,%4,%5")
+                                             .arg(camera.binding.label)
+                                             .arg(r.x(), 0, 'f', 3).arg(r.y(), 0, 'f', 3)
+                                             .arg(r.width(), 0, 'f', 3).arg(r.height(), 0, 'f', 3);
+        }
+        saveCameraRois();
+        applyOverlayForMarkCamera();
+        statusBar()->showMessage(res.join(QStringLiteral("; ")), 20000);
+    });
+    markRow->addWidget(m_btnFindSheet);
     m_btnSaveRef = new QPushButton(QStringLiteral("Сохранить эталон"), m_cameraPanel);
     m_btnLoadRef = new QPushButton(QStringLiteral("Загрузить эталон…"), m_cameraPanel);
     markRow->addWidget(m_btnSaveRef);
@@ -2256,6 +2281,8 @@ void MainWindow::onAutoMatchLoop()
             return;
     }
     m_loopHistory.clear();
+    for (CameraRow &c : m_cameras)
+        c.loopDamp = 1.0;
     m_loopCancel = false;
     if (m_loopUntilTol && m_btnLoopUntil)
         m_btnLoopUntil->setText(QStringLiteral("Стоп"));
@@ -2299,8 +2326,11 @@ void MainWindow::continueAutoMatchLoop()
         progress << QStringLiteral("%1 ΔE %2").arg(c.binding.label).arg(c.deBefore, 0, 'f', 2);
         // no improvement over the last N passes (best of the last N not better than the best before)
         const QVector<double> h = m_loopHistory.value(c.binding.atemId);
-        if (m_loopUntilTol && h.size() > m_loopStallPasses) {
-            const double bestBefore = *std::min_element(h.cbegin(), h.cend() - m_loopStallPasses);
+        // The first measurement is the state before any correction: the first pass may make the metric worse
+        // on purpose (lift / gamma / saturation copied from the reference move the object too), so the
+        // stall rule starts from the first corrected state.
+        if (m_loopUntilTol && h.size() > m_loopStallPasses + 1) {
+            const double bestBefore = *std::min_element(h.cbegin() + 1, h.cend() - m_loopStallPasses);
             const double bestRecent = *std::min_element(h.cend() - m_loopStallPasses, h.cend());
             if (bestRecent > bestBefore * 0.97) {
                 stalled << c.binding.label;
@@ -2545,6 +2575,8 @@ void MainWindow::updateTuningPanelVisibility()
     }
     if (m_btnClearZone)
         m_btnClearZone->setVisible(marking);
+    if (m_btnFindSheet)
+        m_btnFindSheet->setVisible(marking && m_tuningMode != ColorMatchMode::ColorChecker);
     applyOverlayForMarkCamera();
 }
 
@@ -2972,8 +3004,74 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                 if (m_tuningMode == ColorMatchMode::ReferenceCamera && !commonRegion
                     && (!cam.grayRoi.isEmpty() || !m_cameras.at(refIndex).grayRoi.isEmpty()))
                     pre << QStringLiteral("область отмечена только на одной камере — замер по всему кадру");
-                if (zoneUsed && (sm.lift || sm.gamma || sm.saturation))
-                    pre << QStringLiteral("область — для баланса и уровня; лифт/гамма/насыщенность — по всему кадру");
+                // Object mode (zones on both cameras, e.g. the same white sheet): framings differ (4+ cameras
+                // from different angles), so the whole frame is not comparable. The sheet sets the light
+                // colour and level; lift / gamma / saturation / contrast / hue follow the reference camera.
+                const bool objectMode = zoneUsed && refIndex >= 0 && m_cameras.at(refIndex).currentOk && cam.currentOk;
+                const bool copyTone = objectMode && (sm.lift || sm.gamma || sm.saturation);
+                if (objectMode) {
+                    sm.lift = sm.gamma = sm.saturation = false;
+                    sm.objectZone = true;
+                    pre << QStringLiteral("по объекту (область на обеих камерах): цвет и уровень — по области, "
+                                          "лифт/гамма/насыщенность/контраст — как у эталона, весь кадр — только для справки");
+                }
+                if (refIndex >= 0 && m_cameras.at(refIndex).currentOk)
+                    sm.alignDb = m_cameras.at(refIndex).current.gainDb;
+                MatchEngine::SceneDiff sd;
+                if (m_tuningMode == ColorMatchMode::ReferenceCamera || m_tuningMode == ColorMatchMode::ReferenceFrame)
+                    sd = MatchEngine::compareScenes(zoneUsed && camFull.valid ? camFull : cs,
+                                                    zoneUsed && camFull.valid ? refFull : refStats, st.transfer);
+                if (sd.valid && zoneUsed && camFull.valid) {
+                    // the loop must see both: the zone (light colour) and the whole picture (tone)
+                    const MatchEngine::SceneDiff zd = MatchEngine::compareScenes(cs, refStats, st.transfer);
+                    qCInfo(lcRoute).noquote() << QStringLiteral("metric %1 sheet dE %2 zones %3 full dE %4")
+                                                     .arg(cam.binding.label)
+                                                     .arg(zd.valid ? zd.medianDe : -1.0, 0, 'f', 2)
+                                                     .arg(zd.valid ? zd.zoneDeMean : -1.0, 0, 'f', 2)
+                                                     .arg(sd.sceneDe, 0, 'f', 2);
+                    if (zd.valid && objectMode)
+                        cam.notes << QStringLiteral("объект (область): ΔE %1; весь кадр (справка): ΔE %2")
+                                         .arg(zd.medianDe, 0, 'f', 1).arg(sd.sceneDe, 0, 'f', 1);
+                    if (zd.valid)
+                        sd.sceneDe = objectMode ? zd.medianDe : std::max(sd.sceneDe, zd.zoneDeMean);
+                }
+                if (sd.valid) {
+                    cam.notes << QStringLiteral("кадр против эталона: ΔE зон %1 (тени %2, середина %3, света %4), "
+                                                "чёрное %5/%6 IRE, контраст %7/%8 IRE, насыщенность C* %9/%10")
+                                     .arg(sd.zoneDeMean, 0, 'f', 1)
+                                     .arg(sd.zoneDe[0], 0, 'f', 1)
+                                     .arg(sd.zoneDe[2], 0, 'f', 1)
+                                     .arg(sd.zoneDe[4], 0, 'f', 1)
+                                     .arg(sd.shadowIre[0], 0, 'f', 1)
+                                     .arg(sd.shadowIre[1], 0, 'f', 1)
+                                     .arg(sd.contrastIre[0], 0, 'f', 1)
+                                     .arg(sd.contrastIre[1], 0, 'f', 1)
+                                     .arg(sd.chroma75[0], 0, 'f', 1)
+                                     .arg(sd.chroma75[1], 0, 'f', 1);
+                    qCInfo(lcRoute).noquote()
+                        << QStringLiteral("scene %1 dE %2 zones %3/%4/%5/%6/%7 black %8/%9 contrast %10/%11 C75 %12/%13 "
+                                          "C90 %14/%15 sat %16")
+                               .arg(cam.binding.label)
+                               .arg(sd.sceneDe, 0, 'f', 2)
+                               .arg(sd.zoneDe[0], 0, 'f', 1).arg(sd.zoneDe[1], 0, 'f', 1).arg(sd.zoneDe[2], 0, 'f', 1)
+                               .arg(sd.zoneDe[3], 0, 'f', 1).arg(sd.zoneDe[4], 0, 'f', 1)
+                               .arg(sd.shadowIre[0], 0, 'f', 1).arg(sd.shadowIre[1], 0, 'f', 1)
+                               .arg(sd.contrastIre[0], 0, 'f', 1).arg(sd.contrastIre[1], 0, 'f', 1)
+                               .arg(cs.chromaP75, 0, 'f', 1).arg(refStats.chromaP75, 0, 'f', 1)
+                               .arg(cs.chromaP90, 0, 'f', 1).arg(refStats.chromaP90, 0, 'f', 1)
+                               .arg(cam.loopDamp, 0, 'f', 3);
+                }
+                if (m_loopPass > 0 && sd.valid) {
+                    // damping: this pass is worse than the last measurement (overshoot / oscillation, live
+                    // stress 6) -> half the step; improving passes restore it
+                    const QVector<double> h = m_loopHistory.value(cam.binding.atemId);
+                    if (h.size() >= 2) // not after the first pass (see the stall rule)
+                        cam.loopDamp = sd.sceneDe > h.last() * 1.03 + 0.1 ? std::max(0.35, cam.loopDamp * 0.5)
+                                                                          : std::min(1.0, cam.loopDamp * 1.6);
+                }
+                sm.strength *= cam.loopDamp;
+                if (cam.loopDamp < 0.999)
+                    pre << QStringLiteral("шаг уменьшен до %1 % (ΔE вырос после прошлого прохода)").arg(qRound(cam.loopDamp * 100));
                 // Exposure first: when the frames differ by more than 2 stops (or the camera frame is
                 // dark), colour / tone statistics are unreliable - this pass corrects the level only.
                 const double expRatio = cs.p50Linear > 1e-5 ? refStats.p50Linear / cs.p50Linear : 1.0;
@@ -2985,9 +3083,9 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                                .arg(signal[i].lowLight && !refLow ? QStringLiteral("тёмный")
                                                        : QStringLiteral("отличается от эталона более чем на 2 ступени"));
                 }
+                const bool toneFromFrame = zoneUsed && camFull.valid && !objectMode;
                 const MatchEngine::ReferenceMatch rm = MatchEngine::referenceMatch(
-                    cs, refStats, sm, &pre, zoneUsed && camFull.valid ? &camFull : nullptr,
-                    zoneUsed && camFull.valid ? &refFull : nullptr);
+                    cs, refStats, sm, &pre, toneFromFrame ? &camFull : nullptr, toneFromFrame ? &refFull : nullptr);
                 MatchEngine::Settings s2 = sm;
                 s2.saturation = false; // saturation comes from the C* ratio, not from pairs
                 if (refIndex >= 0 && m_cameras.at(refIndex).currentOk && cam.currentOk) {
@@ -3031,43 +3129,23 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                         d.saturation = std::clamp(rm.saturation, 0.8, 1.25);
                 }
                 cam.notes << pre;
-                MatchEngine::SceneDiff sd;
-                if (m_tuningMode == ColorMatchMode::ReferenceCamera || m_tuningMode == ColorMatchMode::ReferenceFrame)
-                    sd = MatchEngine::compareScenes(zoneUsed && camFull.valid ? camFull : cs,
-                                                    zoneUsed && camFull.valid ? refFull : refStats, st.transfer);
-                if (sd.valid && zoneUsed && camFull.valid) {
-                    // the loop must see both: the zone (light colour) and the whole picture (tone)
-                    const MatchEngine::SceneDiff zd = MatchEngine::compareScenes(cs, refStats, st.transfer);
-                    if (zd.valid)
-                        sd.sceneDe = std::max(sd.sceneDe, zd.zoneDeMean);
-                }
-                if (sd.valid) {
-                    cam.notes << QStringLiteral("кадр против эталона: ΔE зон %1 (тени %2, середина %3, света %4), "
-                                                "чёрное %5/%6 IRE, контраст %7/%8 IRE, насыщенность C* %9/%10")
-                                     .arg(sd.zoneDeMean, 0, 'f', 1)
-                                     .arg(sd.zoneDe[0], 0, 'f', 1)
-                                     .arg(sd.zoneDe[2], 0, 'f', 1)
-                                     .arg(sd.zoneDe[4], 0, 'f', 1)
-                                     .arg(sd.shadowIre[0], 0, 'f', 1)
-                                     .arg(sd.shadowIre[1], 0, 'f', 1)
-                                     .arg(sd.contrastIre[0], 0, 'f', 1)
-                                     .arg(sd.contrastIre[1], 0, 'f', 1)
-                                     .arg(sd.chroma75[0], 0, 'f', 1)
-                                     .arg(sd.chroma75[1], 0, 'f', 1);
-                    qCInfo(lcRoute).noquote()
-                        << QStringLiteral("scene %1 dE %2 zones %3/%4/%5/%6/%7 black %8/%9 contrast %10/%11 C75 %12/%13 "
-                                          "C90 %14/%15 sat %16")
-                               .arg(cam.binding.label)
-                               .arg(sd.sceneDe, 0, 'f', 2)
-                               .arg(sd.zoneDe[0], 0, 'f', 1).arg(sd.zoneDe[1], 0, 'f', 1).arg(sd.zoneDe[2], 0, 'f', 1)
-                               .arg(sd.zoneDe[3], 0, 'f', 1).arg(sd.zoneDe[4], 0, 'f', 1)
-                               .arg(sd.shadowIre[0], 0, 'f', 1).arg(sd.shadowIre[1], 0, 'f', 1)
-                               .arg(sd.contrastIre[0], 0, 'f', 1).arg(sd.contrastIre[1], 0, 'f', 1)
-                               .arg(cs.chromaP75, 0, 'f', 1).arg(refStats.chromaP75, 0, 'f', 1)
-                               .arg(cs.chromaP90, 0, 'f', 1).arg(refStats.chromaP90, 0, 'f', 1)
-                               .arg(rm.saturation, 0, 'f', 3);
-                }
                 finishDelta(cam, d, sm, rm.pairs.size(), sd.valid ? sd.sceneDe : -1.0);
+                if (cam.hasProposal && copyTone) {
+                    const CameraCorrectionBundle &rv = m_cameras.at(refIndex).current;
+                    CameraCorrectionBundle &p = cam.proposed;
+                    const bool differs = std::fabs(p.liftR - rv.liftR) + std::fabs(p.liftG - rv.liftG)
+                                             + std::fabs(p.liftB - rv.liftB) + std::fabs(p.liftY - rv.liftY)
+                                             + std::fabs(p.gammaR - rv.gammaR) + std::fabs(p.gammaG - rv.gammaG)
+                                             + std::fabs(p.gammaB - rv.gammaB) + std::fabs(p.gammaY - rv.gammaY)
+                                             + std::fabs(p.saturation - rv.saturation)
+                                         > 0.004f;
+                    p.liftR = rv.liftR; p.liftG = rv.liftG; p.liftB = rv.liftB; p.liftY = rv.liftY;
+                    p.gammaR = rv.gammaR; p.gammaG = rv.gammaG; p.gammaB = rv.gammaB; p.gammaY = rv.gammaY;
+                    p.saturation = rv.saturation;
+                    cam.match.suggested = cam.match.damped = p;
+                    if (differs)
+                        cam.notes << QStringLiteral("лифт/гамма/насыщенность — как у эталона");
+                }
                 if (cam.hasProposal && refIndex >= 0 && m_cameras.at(refIndex).currentOk) {
                     // contrast and hue are not measured - in reference mode they follow the reference camera
                     const CameraCorrectionBundle &rv = m_cameras.at(refIndex).current;
