@@ -2208,6 +2208,8 @@ void MainWindow::onAutoMatchLoop()
             return;
     }
     m_loopHistory.clear();
+    for (CameraRow &c : m_cameras)
+        c.irisUnresponsive = false; // lens may have been switched to remote / replaced: probe again
     m_loopPass = 1;
     qCInfo(lcRoute).noquote() << QStringLiteral("auto loop start mode=%1").arg(colorMatchModeLogName(m_tuningMode));
     onCaptureAnalyze();
@@ -2655,7 +2657,7 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                      qRound(n.height() * img.height()));
     };
     const auto finishDelta = [&](CameraRow &cam, const MatchEngine::Delta &d, const MatchEngine::Settings &s,
-                                 int pairCount) {
+                                 int pairCount, double sceneDe = -1.0) {
         Q_UNUSED(pairCount);
         if (!d.valid) {
             cam.notes << d.notes;
@@ -2670,6 +2672,12 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
         cam.errAfter = d.rmsAfterIre;
         cam.deBefore = d.deBefore;
         cam.deAfter = d.deAfter;
+        if (sceneDe >= 0.0 && d.deBefore >= 0.0) {
+            // reference mode: the grey pairs alone say "matched" while shadows / contrast / saturation are
+            // still off - the loop goes on the whole-picture difference
+            cam.deBefore = std::max(d.deBefore, sceneDe);
+            cam.deAfter = std::max(d.deAfter, 0.0);
+        }
         cam.warnings = MatchEngine::sanityWarnings(cam.current, cam.proposed);
         if (cam.hasRollback && !unlimitedMode()) {
             // Several small passes must not add up to a wild change: check the total drift from the
@@ -2693,7 +2701,7 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                                          .arg(d.deAfter, 0, 'f', 2)
                                          .arg(summarizeChange(cam.current, cam.proposed));
         if (m_loopPass > 0 && d.deBefore >= 0)
-            m_loopHistory[cam.binding.atemId] << d.deBefore;
+            m_loopHistory[cam.binding.atemId] << cam.deBefore;
     };
     const auto finish = [&](CameraRow &cam, const QVector<MatchEngine::Pair> &pairs, MatchEngine::Settings s) {
         if (pairs.isEmpty()) {
@@ -2839,11 +2847,12 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                 // Exposure first: when the frames differ by more than 2 stops (or the camera frame is
                 // dark), colour / tone statistics are unreliable - this pass corrects the level only.
                 const double expRatio = cs.p50Linear > 1e-5 ? refStats.p50Linear / cs.p50Linear : 1.0;
-                if (sm.exposure && (expRatio > 4.0 || expRatio < 0.25 || (signal[i].lowLight && !signal[refIndex].lowLight))
+                const bool refLow = refIndex >= 0 && signal[refIndex].lowLight;
+                if (sm.exposure && (expRatio > 4.0 || expRatio < 0.25 || (signal[i].lowLight && !refLow))
                     && (sm.balance || sm.lift || sm.gamma || sm.saturation)) {
                     sm.balance = sm.lift = sm.gamma = sm.saturation = false;
                     pre << QStringLiteral("сначала уровень: кадр %1 — цвет и тон на следующем проходе")
-                               .arg(signal[i].lowLight && !signal[refIndex].lowLight ? QStringLiteral("тёмный")
+                               .arg(signal[i].lowLight && !refLow ? QStringLiteral("тёмный")
                                                        : QStringLiteral("отличается от эталона более чем на 2 ступени"));
                 }
                 const MatchEngine::ReferenceMatch rm = MatchEngine::referenceMatch(cs, refStats, sm, &pre);
@@ -2853,7 +2862,36 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                 if (sm.saturation)
                     d.saturation = rm.saturation;
                 cam.notes << pre;
-                finishDelta(cam, d, sm, rm.pairs.size());
+                MatchEngine::SceneDiff sd;
+                if (commonRegion || m_tuningMode == ColorMatchMode::ReferenceFrame)
+                    sd = MatchEngine::compareScenes(cs, refStats, st.transfer);
+                if (sd.valid) {
+                    cam.notes << QStringLiteral("кадр против эталона: ΔE зон %1 (тени %2, середина %3, света %4), "
+                                                "чёрное %5/%6 IRE, контраст %7/%8 IRE, насыщенность C* %9/%10")
+                                     .arg(sd.zoneDeMean, 0, 'f', 1)
+                                     .arg(sd.zoneDe[0], 0, 'f', 1)
+                                     .arg(sd.zoneDe[2], 0, 'f', 1)
+                                     .arg(sd.zoneDe[4], 0, 'f', 1)
+                                     .arg(sd.shadowIre[0], 0, 'f', 1)
+                                     .arg(sd.shadowIre[1], 0, 'f', 1)
+                                     .arg(sd.contrastIre[0], 0, 'f', 1)
+                                     .arg(sd.contrastIre[1], 0, 'f', 1)
+                                     .arg(sd.chroma75[0], 0, 'f', 1)
+                                     .arg(sd.chroma75[1], 0, 'f', 1);
+                    qCInfo(lcRoute).noquote()
+                        << QStringLiteral("scene %1 dE %2 zones %3/%4/%5/%6/%7 black %8/%9 contrast %10/%11 C75 %12/%13 "
+                                          "C90 %14/%15 sat %16")
+                               .arg(cam.binding.label)
+                               .arg(sd.sceneDe, 0, 'f', 2)
+                               .arg(sd.zoneDe[0], 0, 'f', 1).arg(sd.zoneDe[1], 0, 'f', 1).arg(sd.zoneDe[2], 0, 'f', 1)
+                               .arg(sd.zoneDe[3], 0, 'f', 1).arg(sd.zoneDe[4], 0, 'f', 1)
+                               .arg(sd.shadowIre[0], 0, 'f', 1).arg(sd.shadowIre[1], 0, 'f', 1)
+                               .arg(sd.contrastIre[0], 0, 'f', 1).arg(sd.contrastIre[1], 0, 'f', 1)
+                               .arg(cs.chromaP75, 0, 'f', 1).arg(refStats.chromaP75, 0, 'f', 1)
+                               .arg(cs.chromaP90, 0, 'f', 1).arg(refStats.chromaP90, 0, 'f', 1)
+                               .arg(rm.saturation, 0, 'f', 3);
+                }
+                finishDelta(cam, d, sm, rm.pairs.size(), sd.valid ? sd.sceneDe : -1.0);
                 qCInfo(lcRoute).noquote()
                     << QStringLiteral("refmatch %1 ill %2/%3/%4 -> %5/%6/%7 p50 %8 -> %9 neutral %10%")
                            .arg(cam.binding.label)
@@ -2975,7 +3013,12 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
             QStringList notes;
             const QVector<MatchEngine::Pair> pairs = MatchEngine::autoPairs(cam.lastFrame, st, targetIre, nullptr, &notes);
             cam.notes << notes;
-            finish(cam, pairs, st);
+            if (st.lift || st.gamma || st.saturation)
+                cam.notes << QStringLiteral("«Нейтральный баланс» ставит только баланс белого и уровень: лифт, гамма "
+                                            "и насыщенность подбираются в режиме «Эталонная камера» (по общей области)");
+            MatchEngine::Settings sn = st;
+            sn.lift = sn.gamma = sn.saturation = false; // one grey level: nothing to fit them to
+            finish(cam, pairs, sn);
         }
         break;
     }

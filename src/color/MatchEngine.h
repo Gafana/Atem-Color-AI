@@ -166,8 +166,31 @@ struct SceneStats
     double neutralFraction = 0;
     double keyLinear = 0;          ///< log-average luma (linear)
     double p25Linear = 0, p50Linear = 0, p75Linear = 0, p90Linear = 0, p98Linear = 0;
+    double p02Linear = 0, p05Linear = 0, p10Linear = 0, p95Linear = 0; ///< shadows / contrast
     double medianChroma = 0;       ///< median chroma (encoded) of mid-tone pixels after neutralising the light
+    /** Colour of near-neutral surfaces per tonal zone (0 shadows p2..p30, 1 mids p30..p70,
+     *  2 highlights p70..p98), linear, luma 1 - a different tint in the shadows than in the highlights
+     *  shows up here. Falls back to illuminantRaw when a zone has too few neutral pixels. */
+    Rgb zoneIll[3] = {{1.0, 1.0, 1.0}, {1.0, 1.0, 1.0}, {1.0, 1.0, 1.0}};
+    int zoneCount[3] = {0, 0, 0};
+    /** Saturation: CIELAB chroma C* of mid-tone pixels (L* 25..85) after neutralising the light and
+     *  normalising the exposure (median -> L* 50) - comparable between cameras and exposures. */
+    double chromaP50 = 0, chromaP75 = 0, chromaP90 = 0;
+    int chromaCount = 0;
 };
+
+/** How different two pictures look: tonal-zone colour, shadows, contrast and saturation. */
+struct SceneDiff
+{
+    bool valid = false;
+    double zoneDe[5] = {0, 0, 0, 0, 0}; ///< ΔE2000 of the zone colours at p5/p25/p50/p75/p95
+    double zoneDeMean = 0;
+    double shadowIre[2] = {0, 0};       ///< p5 luma, camera / reference (IRE)
+    double contrastIre[2] = {0, 0};     ///< p95 - p5 luma, camera / reference (IRE)
+    double chroma75[2] = {0, 0};        ///< C* p75, camera / reference
+    double sceneDe = 0;                 ///< sqrt(zoneDeMean² + (ΔC*75 / 2)²) - single number for the loop
+};
+SceneDiff compareScenes(const SceneStats &cam, const SceneStats &ref, ColorScience::Transfer transfer);
 SceneStats sceneStats(const QImage &image, ColorScience::Transfer transfer, QStringList *notes = nullptr);
 
 struct ReferenceMatch

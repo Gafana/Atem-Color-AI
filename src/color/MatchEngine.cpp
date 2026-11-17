@@ -382,7 +382,9 @@ CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d
         if (plan.irisAv >= 0.0 && std::fabs(plan.irisAv - cur.irisFStopAv) > 1e-3)
             out.irisFStopAv = static_cast<float>(plan.irisAv);
         out.gainDb = plan.gainDb;
-        if (std::fabs(plan.appliedStops) > 0.5) {
+        // Also when gain is traded for iris at the same level: the noise floor / black level moves.
+        const bool lightMoved = plan.gainDb != cur.gainDb && std::abs(plan.gainDb - cur.gainDb) >= 6;
+        if (std::fabs(plan.appliedStops) > 0.5 || lightMoved) {
             // Exposure first: lift/gamma/saturation were fitted on a picture at the wrong level (live test:
             // removing Lift Y in the same pass as +25 dB made a dark scene 5x darker) - next pass.
             bool held = std::fabs(d.saturation - 1.0) > 1e-3;
@@ -545,11 +547,8 @@ LevelPlan planAutoLevel(double stops, double currentAv, int currentDb, bool iris
     plan.irisAv = currentAv;
     plan.gainDb = currentDb;
     double rem = stops;
-    if (std::fabs(stops) < trimStops) {
-        plan.residualStops = stops;
-        return plan;
-    }
     const bool iris = irisUsable && currentAv >= 0.0;
+    const bool trimOnly = std::fabs(stops) < trimStops;
     // Move the gain toward @p target (dB), at most by what is still needed (same sign only).
     const auto useDb = [&](int target) {
         const double room = (target - plan.gainDb) / 6.02;
@@ -573,7 +572,9 @@ LevelPlan planAutoLevel(double stops, double currentAv, int currentDb, bool iris
         plan.irisAv -= take;
         rem -= take;
     };
-    if (stops > 0) {
+    if (trimOnly) {
+        // small change: Gain Y trims it (no iris / gain hunting)
+    } else if (stops > 0) {
         useDb(0);      // negative gain costs dynamic range: back to 0 first
         useIris(2.0);  // f/2
         useDb(12);
@@ -587,6 +588,16 @@ LevelPlan planAutoLevel(double stops, double currentAv, int currentDb, bool iris
     }
     plan.appliedStops = stops - rem;
     plan.residualStops = rem;
+    // Same exposure, less noise: trade sensor gain for a wider iris (down to f/2) in whole gain steps.
+    if (iris && plan.gainDb > 0 && plan.irisAv > 2.0) {
+        const double room = plan.irisAv - 2.0;
+        int swapDb = static_cast<int>(std::floor(std::min(plan.gainDb / 6.02, room) * 6.02 / dbStep + 1e-6)) * dbStep;
+        swapDb = std::min(swapDb, plan.gainDb);
+        if (swapDb > 0) {
+            plan.gainDb -= swapDb;
+            plan.irisAv -= swapDb / 6.02;
+        }
+    }
     if (!iris)
         plan.irisAv = currentAv;
     return plan;
@@ -807,6 +818,7 @@ SceneStats sceneStats(const QImage &imageIn, Transfer transfer, QStringList *not
         double y;
     };
     QVector<Px> valid;
+    QVector<Px> all; // incl. deep shadows (zone colours / chroma)
     QVector<double> lumas;
     lumas.reserve(image.width() * image.height());
     double logSum = 0.0;
@@ -825,6 +837,8 @@ SceneStats sceneStats(const QImage &imageIn, Transfer transfer, QStringList *not
             // ≥3 % code: dark (dim room) pictures still contribute; noise floor and clipping excluded
             if (mx < 0.97 && ey > 0.03 && ey < 0.95)
                 valid << Px{lin, y};
+            if (mx < 0.97 && ey > 0.012)
+                all << Px{lin, y};
         }
     }
     if (lumas.isEmpty())
@@ -842,6 +856,11 @@ SceneStats sceneStats(const QImage &imageIn, Transfer transfer, QStringList *not
     st.p75Linear = q(0.75);
     st.p90Linear = q(0.90);
     st.p98Linear = q(0.98);
+    st.p02Linear = q(0.02);
+    st.p05Linear = q(0.05);
+    st.p10Linear = q(0.10);
+    st.p95Linear = q(0.95);
+    const double qz[4] = {q(0.02), q(0.30), q(0.70), q(0.98)};
 
     // Illuminant. Neutral surfaces (walls, grey/white objects) all share the chromaticity of the light,
     // so they form the densest compact cluster in log-chroma space (u = ln R/G, v = ln B/G) close to the
@@ -966,6 +985,63 @@ SceneStats sceneStats(const QImage &imageIn, Transfer transfer, QStringList *not
     st.illuminant = ill;
     st.neutralFraction = neutralFraction;
 
+    // Zone colours: near-neutral pixels (within 0.25 of the light in log-chroma) per tonal band.
+    {
+        const Rgb raw = st.illuminantRaw;
+        const double u0 = std::log(raw.r / raw.g), v0 = std::log(raw.b / raw.g);
+        double su[3] = {0, 0, 0}, sv[3] = {0, 0, 0}, sw[3] = {0, 0, 0};
+        for (const Px &p : all) {
+            int z = -1;
+            if (p.y >= qz[0] && p.y < qz[1])
+                z = 0;
+            else if (p.y >= qz[1] && p.y < qz[2])
+                z = 1;
+            else if (p.y >= qz[2] && p.y <= qz[3])
+                z = 2;
+            if (z < 0)
+                continue;
+            const double g = std::max(1e-5, p.lin.g);
+            const double u = std::log(std::max(1e-5, p.lin.r) / g);
+            const double v = std::log(std::max(1e-5, p.lin.b) / g);
+            if ((u - u0) * (u - u0) + (v - v0) * (v - v0) > 0.25 * 0.25)
+                continue;
+            const double w = z == 0 ? 1.0 : p.y;
+            su[z] += w * u;
+            sv[z] += w * v;
+            sw[z] += w;
+            ++st.zoneCount[z];
+        }
+        for (int z = 0; z < 3; ++z) {
+            if (st.zoneCount[z] < 40 || sw[z] <= 0.0) {
+                st.zoneIll[z] = raw;
+                continue;
+            }
+            const Rgb e{std::exp(su[z] / sw[z]), 1.0, std::exp(sv[z] / sw[z])};
+            const double ny = luma(e);
+            st.zoneIll[z] = {e.r / ny, e.g / ny, e.b / ny};
+        }
+    }
+    // Saturation in CIELAB: exposure-normalised (median -> mid grey), light neutralised.
+    {
+        const double norm = 0.18 / std::max(1e-4, st.p50Linear);
+        const Rgb raw = st.illuminantRaw;
+        QVector<double> cs;
+        for (const Px &p : all) {
+            const Rgb n{p.lin.r / raw.r * norm, p.lin.g / raw.g * norm, p.lin.b / raw.b * norm};
+            const Lab lab = linear709ToLabD65(n);
+            if (lab.L < 25.0 || lab.L > 85.0)
+                continue;
+            cs << std::hypot(lab.a, lab.b);
+        }
+        st.chromaCount = cs.size();
+        if (cs.size() >= 200) {
+            std::sort(cs.begin(), cs.end());
+            st.chromaP50 = cs[cs.size() / 2];
+            st.chromaP75 = cs[cs.size() * 3 / 4];
+            st.chromaP90 = cs[cs.size() * 9 / 10];
+        }
+    }
+
     // Median chroma of mid-tones once the light is neutralised (for a conservative saturation match).
     QVector<double> chroma;
     for (const Px &p : valid) {
@@ -1020,22 +1096,82 @@ ReferenceMatch referenceMatch(const SceneStats &cam, const SceneStats &ref, cons
     };
     // Grey seen by this camera vs the same grey seen by the reference (scene independent).
     out.pairs << lightPair(grey / std::max(1e-6, factor), grey, 3.0);
-    // 3) tone (only when lift/gamma are enabled): luma percentiles, low weight - exact only if both
-    //    cameras see a similar scene.
+    // 3) tone + tint per zone (only when lift/gamma are enabled): luma percentiles incl. the shadows
+    //    (p2..p10 -> black level / Lift), mids (Gamma) and highlights (Gain); each pair carries the
+    //    colour of the neutral surfaces of its zone, so a cyan highlight or a green shadow is matched by
+    //    the per-channel gain / lift. Exact only if both cameras see a similar scene.
     if (st.lift || st.gamma) {
-        const double cq[4] = {cam.p25Linear, cam.p50Linear, cam.p75Linear, cam.p90Linear};
-        const double rq[4] = {ref.p25Linear, ref.p50Linear, ref.p75Linear, ref.p90Linear};
-        for (int i = 0; i < 4; ++i)
-            if (cq[i] > 1e-4 && rq[i] > 1e-4 && cq[i] < 0.95 && rq[i] < 0.95)
-                out.pairs << lightPair(cq[i], st.exposure ? rq[i] : cq[i], 0.5);
+        struct Q
+        {
+            double c, r, w;
+            int zone;
+        };
+        const Q qs[] = {{cam.p02Linear, ref.p02Linear, 1.0, 0}, {cam.p05Linear, ref.p05Linear, 1.0, 0},
+                        {cam.p10Linear, ref.p10Linear, 0.8, 0}, {cam.p25Linear, ref.p25Linear, 0.6, 0},
+                        {cam.p50Linear, ref.p50Linear, 0.6, 1}, {cam.p75Linear, ref.p75Linear, 0.6, 2},
+                        {cam.p90Linear, ref.p90Linear, 0.6, 2}, {cam.p98Linear, ref.p98Linear, 0.4, 2}};
+        for (const Q &qq : qs) {
+            if (qq.c <= 1e-5 || qq.r <= 1e-5 || qq.c >= 0.95 || qq.r >= 0.95)
+                continue;
+            const Rgb ci = cam.zoneIll[qq.zone];
+            const Rgb ri = st.balance ? ref.zoneIll[qq.zone] : ci;
+            const double tl = st.exposure ? qq.r : qq.c;
+            Pair p;
+            p.measured = encode(Rgb{ci.r * qq.c, ci.g * qq.c, ci.b * qq.c}, st.transfer);
+            p.target = encode(Rgb{ri.r * tl, ri.g * tl, ri.b * tl}, st.transfer);
+            p.neutral = true;
+            p.weight = qq.w;
+            out.pairs << p;
+        }
         if (notes)
-            *notes << QStringLiteral("лифт/гамма по распределению яркости — точны, только если камеры видят похожую сцену");
+            *notes << QStringLiteral("лифт/гамма/оттенок по зонам (тени p2–p10, середина, света) — точны, только если "
+                                     "камеры видят похожую сцену");
     }
-    // 4) saturation: median chroma ratio, conservative.
-    if (st.saturation && cam.medianChroma > 0.01 && ref.medianChroma > 0.01)
-        out.saturation = st.liveLimits ? std::clamp(ref.medianChroma / cam.medianChroma, 0.85, 1.15)
-                                       : ref.medianChroma / cam.medianChroma; // camera range clamps later
+    // 4) saturation: CIELAB chroma of the colourful part of the picture (p75 / p90), exposure-normalised.
+    if (st.saturation && cam.chromaCount >= 200 && ref.chromaCount >= 200 && cam.chromaP75 > 2.0
+        && ref.chromaP75 > 2.0) {
+        const double r = std::sqrt((ref.chromaP75 / cam.chromaP75) * (ref.chromaP90 / std::max(1e-3, cam.chromaP90)));
+        out.saturation = st.liveLimits ? std::clamp(r, 0.85, 1.15) : std::clamp(r, 0.25, 4.0);
+        if (notes)
+            *notes << QStringLiteral("насыщенность: C* p75 %1 → эталон %2 (×%3)")
+                          .arg(cam.chromaP75, 0, 'f', 1)
+                          .arg(ref.chromaP75, 0, 'f', 1)
+                          .arg(out.saturation, 0, 'f', 2);
+    } else if (st.saturation && notes) {
+        *notes << QStringLiteral("насыщенность не считается: мало цветных участков в кадре");
+    }
     return out;
+}
+
+SceneDiff compareScenes(const SceneStats &cam, const SceneStats &ref, Transfer transfer)
+{
+    SceneDiff d;
+    if (!cam.valid || !ref.valid)
+        return d;
+    const double cq[5] = {cam.p05Linear, cam.p25Linear, cam.p50Linear, cam.p75Linear, cam.p95Linear};
+    const double rq[5] = {ref.p05Linear, ref.p25Linear, ref.p50Linear, ref.p75Linear, ref.p95Linear};
+    const int zone[5] = {0, 0, 1, 2, 2};
+    double sum = 0.0;
+    for (int i = 0; i < 5; ++i) {
+        const Rgb a = cam.zoneIll[zone[i]];
+        const Rgb b = ref.zoneIll[zone[i]];
+        // compare as displayed: encode -> decode keeps it in the camera's code range
+        const Lab la = linear709ToLabD65(Rgb{a.r * cq[i], a.g * cq[i], a.b * cq[i]});
+        const Lab lb = linear709ToLabD65(Rgb{b.r * rq[i], b.g * rq[i], b.b * rq[i]});
+        d.zoneDe[i] = deltaE2000(la, lb);
+        sum += d.zoneDe[i];
+    }
+    d.zoneDeMean = sum / 5.0;
+    d.shadowIre[0] = encode(cam.p05Linear, transfer) * 100.0;
+    d.shadowIre[1] = encode(ref.p05Linear, transfer) * 100.0;
+    d.contrastIre[0] = (encode(cam.p95Linear, transfer) - encode(cam.p05Linear, transfer)) * 100.0;
+    d.contrastIre[1] = (encode(ref.p95Linear, transfer) - encode(ref.p05Linear, transfer)) * 100.0;
+    d.chroma75[0] = cam.chromaP75;
+    d.chroma75[1] = ref.chromaP75;
+    const double dc = (cam.chromaCount >= 200 && ref.chromaCount >= 200) ? (cam.chromaP75 - ref.chromaP75) : 0.0;
+    d.sceneDe = std::sqrt(d.zoneDeMean * d.zoneDeMean + 0.25 * dc * dc);
+    d.valid = true;
+    return d;
 }
 
 QVector<Pair> autoPairs(const QImage &imageIn, const Settings &st, double targetGreyIre, AutoEstimate *est,

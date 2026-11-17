@@ -145,6 +145,9 @@ private Q_SLOTS:
     void autoComposeMovesLevelIntoLight();
     void autoColourUsesWhiteBalanceThenCc();
     void irisRespondedDetectsDeadLens();
+    void referenceMatchFixesWashedOutCamera();
+    void sceneStatsZoneTint();
+    void autoLevelTradesGainForIris();
 };
 
 void TestMatchEngine::deltaE2000Reference()
@@ -517,8 +520,9 @@ void TestMatchEngine::unlimitedModeTakesFullStep()
     cam.keyLinear = 0.01;
     ref.p25Linear = 0.04; ref.p50Linear = 0.08; ref.p75Linear = 0.16; ref.p90Linear = 0.24; ref.p98Linear = 0.4;
     ref.keyLinear = 0.08;
-    cam.medianChroma = 0.05;
-    ref.medianChroma = 0.10;
+    cam.chromaCount = ref.chromaCount = 1000;
+    cam.chromaP75 = 10.0; cam.chromaP90 = 15.0;
+    ref.chromaP75 = 20.0; ref.chromaP90 = 30.0;
     MatchEngine::Settings st;
     st.saturation = true;
     const auto levelOf = [](const MatchEngine::Settings &s, const MatchEngine::ReferenceMatch &rm) {
@@ -659,6 +663,85 @@ void TestMatchEngine::irisRespondedDetectsDeadLens()
     QVERIFY(MatchEngine::irisResponded(0.30, 0.30, 0.2, 0.0));
     // live: f/1.0 -> f/1.25 (0.33 stop) on a lens that does not follow
     QVERIFY(!MatchEngine::irisResponded(121.7 / 255, 121.6 / 255, -0.33, 0.0));
+}
+
+void TestMatchEngine::referenceMatchFixesWashedOutCamera()
+{
+    // Live complaint 17.11: CAM2 matched on grey looked washed out next to CAM1 - lifted blacks, low
+    // contrast, low saturation, cool highlights. Same scene (common region), reference mode.
+    const Scene scene = chartScene();
+    SimCamera ref;
+    SimCamera cam;
+    cam.state.liftY = 0.06f;
+    cam.state.gammaY = 0.10f;
+    cam.state.saturation = 0.55f;
+    cam.state.gainB = 1.08f;
+    cam.state.gainR = 0.95f;
+    MatchEngine::Settings st;
+    st.liveLimits = false;
+    st.lift = st.gamma = st.saturation = true;
+    const MatchEngine::SceneStats rs = MatchEngine::sceneStats(ref.render(scene), st.transfer);
+    const MatchEngine::SceneDiff d0 = MatchEngine::compareScenes(
+        MatchEngine::sceneStats(cam.render(scene), st.transfer), rs, st.transfer);
+    QStringList log;
+    for (int pass = 0; pass < 4; ++pass) {
+        const MatchEngine::SceneStats cs = MatchEngine::sceneStats(cam.render(scene), st.transfer);
+        const MatchEngine::ReferenceMatch m = MatchEngine::referenceMatch(cs, rs, st);
+        MatchEngine::Settings s2 = st;
+        s2.saturation = false;
+        MatchEngine::Delta d = MatchEngine::solve(m.pairs, s2);
+        d.saturation = m.saturation;
+        cam.state = MatchEngine::compose(cam.state, d, st);
+        const MatchEngine::SceneDiff di = MatchEngine::compareScenes(
+            MatchEngine::sceneStats(cam.render(scene), st.transfer), rs, st.transfer);
+        log << QStringLiteral("dE %1 black %2/%3 C %4/%5 sat %6 liftY %7")
+                   .arg(di.sceneDe, 0, 'f', 2)
+                   .arg(di.shadowIre[0], 0, 'f', 1)
+                   .arg(di.shadowIre[1], 0, 'f', 1)
+                   .arg(di.chroma75[0], 0, 'f', 1)
+                   .arg(di.chroma75[1], 0, 'f', 1)
+                   .arg(cam.state.saturation, 0, 'f', 2)
+                   .arg(cam.state.liftY, 0, 'f', 3);
+    }
+    const MatchEngine::SceneDiff d1 = MatchEngine::compareScenes(
+        MatchEngine::sceneStats(cam.render(scene), st.transfer), rs, st.transfer);
+    qInfo().noquote() << "washed out: before dE" << d0.sceneDe << "black" << d0.shadowIre[0] << "/" << d0.shadowIre[1]
+                      << "C75" << d0.chroma75[0] << "/" << d0.chroma75[1] << "\n  " << log.join(QStringLiteral("\n  "));
+    QVERIFY(d0.sceneDe > 5.0);
+    QVERIFY2(d1.sceneDe < d0.sceneDe * 0.35, qPrintable(log.join(QStringLiteral("; "))));
+    QVERIFY(std::fabs(d1.shadowIre[0] - d1.shadowIre[1]) < 2.0);
+    QVERIFY(std::fabs(d1.chroma75[0] / d1.chroma75[1] - 1.0) < 0.12);
+}
+
+void TestMatchEngine::sceneStatsZoneTint()
+{
+    // Grey ramp: shadows greenish, highlights cool - zone colours must show it.
+    QImage img(256, 64, QImage::Format_RGB32);
+    for (int x = 0; x < 256; ++x) {
+        const double v = 0.05 + 0.9 * x / 255.0;
+        const double t = x / 255.0;
+        const Rgb e{v * (1.0 - 0.04 * (1 - t)) * (1.0 - 0.03 * t), v, v * (1.0 - 0.04 * (1 - t)) * (1.0 + 0.05 * t)};
+        for (int y = 0; y < 64; ++y)
+            img.setPixel(x, y, qRgb(qRound(std::min(1.0, e.r) * 255), qRound(e.g * 255), qRound(std::min(1.0, e.b) * 255)));
+    }
+    const MatchEngine::SceneStats s = MatchEngine::sceneStats(img, Transfer::Bt709Oetf);
+    QVERIFY(s.valid);
+    qInfo() << "zones" << s.zoneIll[0].r << s.zoneIll[0].g << s.zoneIll[0].b << "|" << s.zoneIll[2].r << s.zoneIll[2].g
+            << s.zoneIll[2].b;
+    QVERIFY(s.zoneIll[0].g > s.zoneIll[0].r && s.zoneIll[0].g > s.zoneIll[0].b); // green shadows
+    QVERIFY(s.zoneIll[2].b > s.zoneIll[2].r);                                    // cool highlights
+}
+
+void TestMatchEngine::autoLevelTradesGainForIris()
+{
+    // CAM2 live: f/5.3 (Av 4.83) with 36 dB - same exposure with the iris open and less gain.
+    const MatchEngine::LevelPlan p = MatchEngine::planAutoLevel(0.0, 4.83, 36, true, true);
+    QCOMPARE(p.gainDb, 24);
+    QVERIFY(std::fabs(p.irisAv - (4.83 - 12 / 6.02)) < 1e-6);
+    QVERIFY(std::fabs(p.appliedStops) < 1e-9);
+    // dead iris: nothing traded
+    const MatchEngine::LevelPlan q = MatchEngine::planAutoLevel(0.0, 4.83, 36, false, true);
+    QCOMPARE(q.gainDb, 36);
 }
 
 QTEST_MAIN(TestMatchEngine)
