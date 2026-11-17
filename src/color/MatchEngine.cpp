@@ -11,6 +11,12 @@ using namespace ColorScience;
 
 namespace MatchEngine {
 
+// weight of the per-channel histogram pairs next to the zone-tint tone pairs (sim: faster first passes;
+// alone they floor at ~1.2 ΔE on colourful scenes, so they only help)
+constexpr double kHistWeight = 0.35;
+// strength of the unwind prior (lift / gamma toward the reference's own values), relative to the data
+constexpr double kUnwindW = 0.02;
+
 namespace {
 
 constexpr double kMidGreyEncoded = 0.409; // BT.709 OETF of 18 % grey
@@ -56,7 +62,7 @@ bool solve3(double A[3][3], const double b[3], double out[3])
 
 /** Weighted LM fit of ChannelCurve to samples; disabled params stay at identity.
  *  Parameters: p0 = ln(gain), p1 = lift, p2 = gamma. Ridge priors keep ill-determined params near 0. */
-ChannelCurve fitCurve(const QVector<Sample> &s, bool fitLift, bool fitGamma)
+ChannelCurve fitCurve(const QVector<Sample> &s, bool fitLift, bool fitGamma, const double *unwindTo = nullptr)
 {
     ChannelCurve c;
     if (s.isEmpty())
@@ -77,6 +83,9 @@ ChannelCurve fitCurve(const QVector<Sample> &s, bool fitLift, bool fitGamma)
     for (const Sample &k : s)
         wsum += k.w;
     const double prior[3] = {1e-4 * wsum, 0.004 * wsum, 0.01 * wsum};
+    // unwind prior: toward the (lift, gamma) change that brings the camera to the reference's values
+    const double uw[3] = {0.0, unwindTo ? kUnwindW * wsum : 0.0, unwindTo ? kUnwindW * wsum : 0.0};
+    const double uc[3] = {0.0, unwindTo ? unwindTo[0] : 0.0, unwindTo ? unwindTo[1] : 0.0};
     auto model = [](const double *q, double x) {
         ChannelCurve cc;
         cc.gain = std::exp(q[0]);
@@ -91,7 +100,7 @@ ChannelCurve fitCurve(const QVector<Sample> &s, bool fitLift, bool fitGamma)
             e += k.w * r * r;
         }
         for (int i = 0; i < 3; ++i)
-            e += prior[i] * q[i] * q[i];
+            e += prior[i] * q[i] * q[i] + uw[i] * (q[i] - uc[i]) * (q[i] - uc[i]);
         return e;
     };
     double lambda = 1e-3;
@@ -121,9 +130,9 @@ ChannelCurve fitCurve(const QVector<Sample> &s, bool fitLift, bool fitGamma)
         double b[3];
         for (int i = 0; i < 3; ++i) {
             for (int j = 0; j < 3; ++j)
-                A[i][j] = JtJ[i][j] + (i == j ? prior[i] : 0.0);
+                A[i][j] = JtJ[i][j] + (i == j ? prior[i] + uw[i] : 0.0);
             A[i][i] *= (1.0 + lambda);
-            b[i] = -(Jtr[i] + prior[i] * p[i]);
+            b[i] = -(Jtr[i] + prior[i] * p[i] + uw[i] * (p[i] - uc[i]));
             if (!en[i]) {
                 for (int j = 0; j < 3; ++j)
                     A[i][j] = A[j][i] = 0.0;
@@ -265,7 +274,8 @@ Delta solve(const QVector<Pair> &pairsIn, const Settings &st)
             QVector<Sample> s;
             for (const Pair &p : pairs)
                 s << Sample{p.measured[c], p.target[c], p.weight * (p.neutral ? 3.0 : 1.0)};
-            d.ch[c] = fitCurve(s, fitLift, fitGamma);
+            const double uwc[2] = {st.unwindLift[c], st.unwindGamma[c]};
+            d.ch[c] = fitCurve(s, fitLift, fitGamma, st.unwind ? uwc : nullptr);
         }
         if (!st.exposure) {
             // keep mid-grey luminance unchanged: only the balance between channels moves
@@ -446,9 +456,15 @@ CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d
 
     if (st.balance && st.balanceVia == BalanceVia::Auto) {
         // Bulk cast -> camera white balance (on the sensor), residual -> RGB CC gain.
-        const Rgb m{linearRatioOfEncodedGain(bal[0] / bal[1], st.transfer), 1.0,
-                    linearRatioOfEncodedGain(bal[2] / bal[1], st.transfer)};
+        // CC gain first unwinds toward the reference's CC ratios; the white balance gets the rest
+        const double ur = st.unwindGain ? std::clamp(st.unwindGainRB[0], 0.8, 1.25) : 1.0;
+        const double ub = st.unwindGain ? std::clamp(st.unwindGainRB[1], 0.8, 1.25) : 1.0;
+        const Rgb m{linearRatioOfEncodedGain(bal[0] / bal[1] / ur, st.transfer), 1.0,
+                    linearRatioOfEncodedGain(bal[2] / bal[1] / ub, st.transfer)};
         const double bulk = std::max(std::fabs(std::log(m.r)), std::fabs(std::log(m.b)));
+        if (st.unwindGain && (std::fabs(ur - 1.0) > 0.005 || std::fabs(ub - 1.0) > 0.005) && notes)
+            *notes << QStringLiteral("CC Gain возвращается к соотношениям эталона: R×%1 B×%2, остальное — баланс белого")
+                          .arg(ur, 0, 'f', 3).arg(ub, 0, 'f', 3);
         if (bulk > 0.03) {
             const double k0 = cur.whiteBalanceKelvin > 0 ? cur.whiteBalanceKelvin : 5600.0;
             const Rgb w0 = planckianWhite(k0);
@@ -468,8 +484,8 @@ CameraCorrectionBundle compose(const CameraCorrectionBundle &cur, const Delta &d
             const double tf = std::exp(kTintPerUnit * (tOut - cur.whiteBalanceTint));
             // The white balance takes the bulk; the CC residual is a trim (±25 %) - a larger residual means
             // the estimate is unreliable (e.g. a noisy dark frame), the next pass refines it.
-            const double rr = std::clamp(encodedGainOfLinearRatio(m.r / (ar * tf), st.transfer), 0.8, 1.25);
-            const double rb = std::clamp(encodedGainOfLinearRatio(m.b / (ab * tf), st.transfer), 0.8, 1.25);
+            const double rr = std::clamp(encodedGainOfLinearRatio(m.r / (ar * tf), st.transfer), 0.8, 1.25) * ur;
+            const double rb = std::clamp(encodedGainOfLinearRatio(m.b / (ab * tf), st.transfer), 0.8, 1.25) * ub;
             const double norm = kLumaR * rr + kLumaG + kLumaB * rb;
             bal[0] = rr / norm;
             bal[1] = 1.0 / norm;
@@ -860,6 +876,35 @@ SceneStats sceneStats(const QImage &imageIn, Transfer transfer, QStringList *not
             *notes << QStringLiteral("кадр почти чёрный или пересвечен — поправка не рассчитана");
         return st;
     }
+    {
+        // per-channel histograms of the encoded picture (8-bit) -> percentiles
+        static const double kq[SceneStats::kChannelQ] = {0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.98};
+        quint32 hist[3][256] = {};
+        quint64 n = 0;
+        for (int yy = 0; yy < image.height(); ++yy) {
+            const QRgb *row = reinterpret_cast<const QRgb *>(image.constScanLine(yy));
+            for (int x = 0; x < image.width(); ++x) {
+                ++hist[0][qRed(row[x])];
+                ++hist[1][qGreen(row[x])];
+                ++hist[2][qBlue(row[x])];
+                ++n;
+            }
+        }
+        for (int c = 0; c < 3; ++c) {
+            quint64 acc = 0;
+            int k = 0;
+            for (int v = 0; v < 256 && k < SceneStats::kChannelQ; ++v) {
+                const quint64 prev = acc;
+                acc += hist[c][v];
+                while (k < SceneStats::kChannelQ && acc >= kq[k] * n) {
+                    // interpolate inside the bin
+                    const double frac = hist[c][v] ? (kq[k] * n - prev) / hist[c][v] : 0.5;
+                    st.chQ[c][k] = (v - 0.5 + std::clamp(frac, 0.0, 1.0)) / 255.0;
+                    ++k;
+                }
+            }
+        }
+    }
     std::sort(lumas.begin(), lumas.end());
     const auto q = [&](double p) { return lumas[static_cast<int>(p * (lumas.size() - 1))]; };
     st.keyLinear = std::exp(logSum / std::max(1, logN));
@@ -1209,6 +1254,36 @@ ReferenceMatch referenceMatch(const SceneStats &cam, const SceneStats &ref, cons
         if (notes)
             *notes << QStringLiteral("лифт/гамма/оттенок по зонам (тени p2–p10, середина, света) — точны, только если "
                                      "камеры видят похожую сцену");
+    }
+    if ((st.lift || st.gamma) && kHistWeight > 0) {
+        // Channel transfer by histogram matching: the k-th percentile of R (G, B) in this camera should
+        // land on the k-th percentile of the same channel in the reference. Dense p2..p98 pins lift
+        // (shadows), gamma (mids) and gain (highlights) per channel at once, tint per zone included.
+        const double toneRatioH = tc.p50Linear > 1e-5 ? tr.p50Linear / tc.p50Linear : 1.0;
+        const double levelFixH = separateTone && toneRatioH > 1e-3 ? factor / toneRatioH : 1.0;
+        for (int k = 0; k < SceneStats::kChannelQ; ++k) {
+            Rgb m{tc.chQ[0][k], tc.chQ[1][k], tc.chQ[2][k]};
+            Rgb t{tr.chQ[0][k], tr.chQ[1][k], tr.chQ[2][k]};
+            if (std::max({m.r, m.g, m.b}) >= 0.97 || std::max({t.r, t.g, t.b}) >= 0.97)
+                continue; // clipped
+            if (std::fabs(levelFixH - 1.0) > 1e-3) {
+                const Rgb lin = decode(t, st.transfer);
+                t = encode(Rgb{lin.r * levelFixH, lin.g * levelFixH, lin.b * levelFixH}, st.transfer);
+            }
+            const double lm = luma(m), lt = luma(t);
+            if (!st.balance && lm > 1e-4) // keep this camera's colour, take the reference's level
+                t = Rgb{m.r * lt / lm, m.g * lt / lm, m.b * lt / lm};
+            if (!st.exposure && lt > 1e-4) // keep this camera's level
+                t = Rgb{t.r * lm / lt, t.g * lm / lt, t.b * lm / lt};
+            Pair p;
+            p.measured = m;
+            p.target = t;
+            p.neutral = true;
+            p.weight = kHistWeight * ((k == 0 || k == SceneStats::kChannelQ - 1) ? 0.6 : 1.0);
+            out.pairs << p;
+        }
+        if (notes)
+            *notes << QStringLiteral("плюс сопоставление гистограмм R/G/B (p2–p98) с эталоном");
     }
     // 4) saturation: CIELAB chroma of the colourful part of the picture (p75 / p90), exposure-normalised.
     if (st.saturation && tc.chromaCount >= 200 && tr.chromaCount >= 200 && tc.chromaP75 > 2.0

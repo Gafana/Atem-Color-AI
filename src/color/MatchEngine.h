@@ -62,6 +62,19 @@ struct Settings
     /** Auto level may use the lens iris (false when the lens is not controllable / did not follow). */
     bool irisUsable = true;
     ColorScience::Transfer transfer = ColorScience::Transfer::Bt709Oetf;
+    /** Unwinding: lift and gamma can trade off over the measured range (live: a blue lift hid behind a
+     *  blue gamma -0.3 and stayed). When set, the per-channel fit is pulled toward the change that would
+     *  bring the camera's absolute R/G/B lift / gamma to these targets (the reference camera's values),
+     *  so the ambiguity resolves toward the reference instead of an equal-looking compensating pair. */
+    bool unwind = false;
+    double unwindLift[3] = {0, 0, 0};  ///< wanted delta lift per channel (reference - current)
+    double unwindGamma[3] = {0, 0, 0}; ///< wanted delta gamma per channel
+    /** Same for white balance vs CC gain (BalanceVia::Auto): both tint the picture, a skewed CC gain was
+     *  left in place and the white balance drifted to compensate (live: gain B 0.61 + 3450 K). The CC
+     *  part of the change first moves the camera's R/G and B/G CC gain ratios by these factors (toward
+     *  the reference's, ±25 % per pass), the white balance takes the rest. */
+    bool unwindGain = false;
+    double unwindGainRB[2] = {1.0, 1.0};
 };
 
 /** Model of one channel of the camera primary grade on encoded signal x in [0,1]:
@@ -177,6 +190,10 @@ struct SceneStats
      *  normalising the exposure (median -> L* 50) - comparable between cameras and exposures. */
     double chromaP50 = 0, chromaP75 = 0, chromaP90 = 0;
     int chromaCount = 0;
+    /** Per-channel histogram percentiles (encoded) at kChannelQuantiles - the channel transfer curve of
+     *  the camera is fitted by matching them to the reference (robust to small framing differences). */
+    static constexpr int kChannelQ = 12;
+    double chQ[3][kChannelQ] = {};
 };
 
 /** How different two pictures look: tonal-zone colour, shadows, contrast and saturation. */

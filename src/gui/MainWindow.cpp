@@ -2387,9 +2387,15 @@ void MainWindow::finishAutoMatchLoop(const QString &why)
     }
     if (m_btnLoop)
         m_btnLoop->setEnabled(!m_busy);
-    QStringList parts;
+    QStringList parts, ascii;
     for (const CameraRow &c : m_cameras) {
         const QVector<double> h = m_loopHistory.value(c.binding.atemId);
+        if (!h.isEmpty()) {
+            QStringList v;
+            for (double d : h)
+                v << QString::number(d, 'f', 2);
+            ascii << QStringLiteral("cam%1 dE %2").arg(c.binding.atemId).arg(v.join(QLatin1Char(' ')));
+        }
         if (h.isEmpty())
             continue;
         QStringList v;
@@ -2399,6 +2405,7 @@ void MainWindow::finishAutoMatchLoop(const QString &why)
     }
     const QString text = QStringLiteral("Авто-подгонка завершена (%1). %2").arg(why, parts.join(QStringLiteral("; ")));
     qCInfo(lcRoute).noquote() << text;
+    qCInfo(lcRoute).noquote() << QStringLiteral("auto loop end: ") + ascii.join(QStringLiteral("; "));
     setCaptureStatus(text);
     statusBar()->showMessage(text, 30000);
     refreshCorrectionsTable();
@@ -2982,10 +2989,47 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                     cs, refStats, sm, &pre, zoneUsed && camFull.valid ? &camFull : nullptr,
                     zoneUsed && camFull.valid ? &refFull : nullptr);
                 MatchEngine::Settings s2 = sm;
-                s2.saturation = false; // saturation comes from the median-chroma ratio, not from pairs
+                s2.saturation = false; // saturation comes from the C* ratio, not from pairs
+                if (refIndex >= 0 && m_cameras.at(refIndex).currentOk && cam.currentOk) {
+                    // resolve the lift/gamma trade-off toward the reference camera's own values
+                    const CameraCorrectionBundle &rv = m_cameras.at(refIndex).current;
+                    const CameraCorrectionBundle &cv = cam.current;
+                    const float rl[3] = {rv.liftR, rv.liftG, rv.liftB}, cl[3] = {cv.liftR, cv.liftG, cv.liftB};
+                    const float rg[3] = {rv.gammaR, rv.gammaG, rv.gammaB}, cg[3] = {cv.gammaR, cv.gammaG, cv.gammaB};
+                    s2.unwind = true;
+                    for (int c = 0; c < 3; ++c) {
+                        s2.unwindLift[c] = (rl[c] + rv.liftY) - (cl[c] + cv.liftY);
+                        s2.unwindGamma[c] = (rg[c] + rv.gammaY) - (cg[c] + cv.gammaY);
+                    }
+                }
+                if (refIndex >= 0 && m_cameras.at(refIndex).currentOk && cam.currentOk) {
+                    const CameraCorrectionBundle &rv = m_cameras.at(refIndex).current;
+                    const CameraCorrectionBundle &cv = cam.current;
+                    if (rv.gainG > 0.01f && cv.gainR > 0.01f && cv.gainB > 0.01f) {
+                        sm.unwindGain = true;
+                        sm.unwindGainRB[0] = (double(rv.gainR) / rv.gainG) / (double(cv.gainR) / cv.gainG);
+                        sm.unwindGainRB[1] = (double(rv.gainB) / rv.gainG) / (double(cv.gainB) / cv.gainG);
+                    }
+                }
                 MatchEngine::Delta d = MatchEngine::solve(rm.pairs, s2);
-                if (sm.saturation)
-                    d.saturation = rm.saturation;
+                if (sm.saturation) {
+                    // C* is unreliable under a strong cast (the cast itself is chroma): saturation waits for
+                    // the colour; otherwise at most ±25 % per pass
+                    const double castR = std::fabs(std::log(std::max(1e-4, d.ch[0].gain) / std::max(1e-4, d.ch[1].gain)));
+                    const double castB = std::fabs(std::log(std::max(1e-4, d.ch[2].gain) / std::max(1e-4, d.ch[1].gain)));
+                    const bool refOk = refIndex >= 0 && m_cameras.at(refIndex).currentOk && cam.currentOk
+                                       && cam.current.saturation > 0.01f;
+                    if (refStats.chromaP75 < 4.0 && refOk) {
+                        // near-neutral scene (live: C* 1-6): chroma cannot be measured - follow the reference
+                        d.saturation = std::clamp(double(m_cameras.at(refIndex).current.saturation)
+                                                      / cam.current.saturation, 0.8, 1.25);
+                        pre << QStringLiteral("сцена почти без цвета — насыщенность как у эталона (%1)")
+                                   .arg(m_cameras.at(refIndex).current.saturation, 0, 'f', 2);
+                    } else if (std::max(castR, castB) > 0.06 || std::fabs(d.ch[0].lift - d.ch[2].lift) > 0.03)
+                        pre << QStringLiteral("насыщенность — после выравнивания цвета (сильный оттенок, C* ненадёжна)");
+                    else
+                        d.saturation = std::clamp(rm.saturation, 0.8, 1.25);
+                }
                 cam.notes << pre;
                 MatchEngine::SceneDiff sd;
                 if (m_tuningMode == ColorMatchMode::ReferenceCamera || m_tuningMode == ColorMatchMode::ReferenceFrame)
@@ -3024,6 +3068,21 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                                .arg(rm.saturation, 0, 'f', 3);
                 }
                 finishDelta(cam, d, sm, rm.pairs.size(), sd.valid ? sd.sceneDe : -1.0);
+                if (cam.hasProposal && refIndex >= 0 && m_cameras.at(refIndex).currentOk) {
+                    // contrast and hue are not measured - in reference mode they follow the reference camera
+                    const CameraCorrectionBundle &rv = m_cameras.at(refIndex).current;
+                    if (std::fabs(cam.proposed.contrastAdj - rv.contrastAdj) > 0.01f
+                        || std::fabs(cam.proposed.contrastPivot - rv.contrastPivot) > 0.01f
+                        || std::fabs(cam.proposed.hue - rv.hue) > 0.01f) {
+                        cam.notes << QStringLiteral("контраст %1 → %2, hue %3 → %4 — как у эталона")
+                                         .arg(cam.proposed.contrastAdj, 0, 'f', 2).arg(rv.contrastAdj, 0, 'f', 2)
+                                         .arg(cam.proposed.hue, 0, 'f', 2).arg(rv.hue, 0, 'f', 2);
+                        cam.proposed.contrastAdj = rv.contrastAdj;
+                        cam.proposed.contrastPivot = rv.contrastPivot;
+                        cam.proposed.hue = rv.hue;
+                        cam.match.suggested = cam.match.damped = cam.proposed;
+                    }
+                }
                 qCInfo(lcRoute).noquote()
                     << QStringLiteral("refmatch %1 ill %2/%3/%4 -> %5/%6/%7 p50 %8 -> %9 neutral %10%")
                            .arg(cam.binding.label)

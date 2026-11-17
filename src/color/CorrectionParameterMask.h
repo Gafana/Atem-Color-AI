@@ -12,7 +12,7 @@ struct CorrectionParameterMask
     bool gain = true;
     bool level = true;
     bool saturation = true;
-    bool hue = false;
+    bool hue = true; ///< only changed by presets / reference mode (follows the reference camera)
     bool iris = true;     ///< lens aperture (only sent when the value changes)
     bool offset = true;   ///< 8.3 offset (only changed by presets / manual edits)
     bool contrast = true; ///< 8.4 contrast + 8.5 luma mix (presets / manual edits)

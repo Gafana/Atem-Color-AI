@@ -149,6 +149,9 @@ private Q_SLOTS:
     void sceneStatsZoneTint();
     void autoLevelTradesGainForIris();
     void referenceMatchFixesTintedLiftAndWrongKelvin();
+    void referenceMatchUnwindsLiftGammaPair();
+    void sceneStatsChannelQuantiles();
+    void referenceMatchUnwindsCcGainSkew();
 };
 
 void TestMatchEngine::deltaE2000Reference()
@@ -785,6 +788,15 @@ void TestMatchEngine::referenceMatchFixesTintedLiftAndWrongKelvin()
         const MatchEngine::ReferenceMatch m = MatchEngine::referenceMatch(cs, rs, st);
         MatchEngine::Settings s2 = st;
         s2.saturation = false;
+        s2.unwind = true;
+        {
+            const float cl[3] = {cam.state.liftR, cam.state.liftG, cam.state.liftB};
+            const float cg[3] = {cam.state.gammaR, cam.state.gammaG, cam.state.gammaB};
+            for (int c = 0; c < 3; ++c) {
+                s2.unwindLift[c] = -(cl[c] + cam.state.liftY);
+                s2.unwindGamma[c] = -(cg[c] + cam.state.gammaY);
+            }
+        }
         MatchEngine::Delta d = MatchEngine::solve(m.pairs, s2);
         d.saturation = m.saturation;
         cam.state = MatchEngine::compose(cam.state, d, st);
@@ -802,6 +814,143 @@ void TestMatchEngine::referenceMatchFixesTintedLiftAndWrongKelvin()
     qInfo().noquote() << "tinted lift: dE" << de0 << "\n  " << log.join(QStringLiteral("\n  "));
     QVERIFY(de0 > 5.0);
     QVERIFY2(diff().sceneDe < 1.5, qPrintable(log.join(QStringLiteral("; "))));
+}
+
+void TestMatchEngine::sceneStatsChannelQuantiles()
+{
+    // horizontal ramp, blue channel offset: per-channel percentiles follow each channel
+    QImage img(200, 20, QImage::Format_RGB32);
+    for (int x = 0; x < 200; ++x)
+        for (int y = 0; y < 20; ++y)
+            img.setPixel(x, y, qRgb(x + 20, x + 20, x + 40));
+    const MatchEngine::SceneStats s = MatchEngine::sceneStats(img, Transfer::Bt709Oetf);
+    QVERIFY(s.valid);
+    // median ~ (100+20)/255 for R, (100+40)/255 for B (image is resampled, allow a little slack)
+    QVERIFY(std::fabs(s.chQ[0][6] - 120.0 / 255.0) < 0.02);
+    QVERIFY(std::fabs(s.chQ[2][6] - 140.0 / 255.0) < 0.02);
+    QVERIFY(s.chQ[0][0] < s.chQ[0][11]);
+}
+
+void TestMatchEngine::referenceMatchUnwindsLiftGammaPair()
+{
+    // Live plateau 18.11 00:10: blue lift +0.11 hidden behind blue gamma -0.29 (+ red/Y gamma) - the
+    // pair looks almost right on the measured range, the solver stalled at ΔE ~3.5. With the unwind
+    // prior toward the reference's own lift/gamma the pair must come apart.
+    Scene scene;
+    const Scene chart = chartScene();
+    const double greys[16] = {0.008, 0.015, 0.025, 0.04, 0.06, 0.08, 0.11, 0.15, 0.2, 0.26, 0.33, 0.42, 0.52, 0.63, 0.75, 0.88};
+    for (int i = 0; i < 24; ++i) {
+        if (i % 3 == 2) {
+            scene.patchesLinear << chart.patchesLinear[(i * 7) % 18];
+        } else {
+            const double g = greys[(i * 2 / 3) % 16];
+            scene.neutral << scene.patchesLinear.size();
+            scene.patchesLinear << Rgb{g, g, g};
+        }
+    }
+    SimCamera ref;
+    ref.lightKelvin = 4000;
+    ref.state.whiteBalanceKelvin = 4000;
+    SimCamera cam = ref;
+    cam.state.liftB = 0.113f;
+    cam.state.gammaR = 0.151f;
+    cam.state.gammaB = -0.293f;
+    cam.state.gammaY = -0.151f;
+    cam.state.gainY = 1.158f;
+    MatchEngine::Settings st;
+    st.liveLimits = false;
+    st.lift = st.gamma = st.saturation = true;
+    const MatchEngine::SceneStats rs = MatchEngine::sceneStats(ref.render(scene), st.transfer);
+    const auto diff = [&] {
+        return MatchEngine::compareScenes(MatchEngine::sceneStats(cam.render(scene), st.transfer), rs, st.transfer);
+    };
+    const double de0 = diff().sceneDe;
+    QStringList log;
+    for (int pass = 0; pass < 8; ++pass) {
+        const MatchEngine::SceneStats cs = MatchEngine::sceneStats(cam.render(scene), st.transfer);
+        const MatchEngine::ReferenceMatch m = MatchEngine::referenceMatch(cs, rs, st);
+        MatchEngine::Settings s2 = st;
+        s2.saturation = false;
+        s2.unwind = true;
+        const float cl[3] = {cam.state.liftR, cam.state.liftG, cam.state.liftB};
+        const float cg[3] = {cam.state.gammaR, cam.state.gammaG, cam.state.gammaB};
+        for (int c = 0; c < 3; ++c) {
+            s2.unwindLift[c] = -(cl[c] + cam.state.liftY);
+            s2.unwindGamma[c] = -(cg[c] + cam.state.gammaY);
+        }
+        MatchEngine::Delta d = MatchEngine::solve(m.pairs, s2);
+        d.saturation = m.saturation;
+        cam.state = MatchEngine::compose(cam.state, d, st);
+        log << QStringLiteral("dE %1 liftB %2 gammaR %3 gammaB %4 gammaY %5")
+                   .arg(diff().sceneDe, 0, 'f', 2)
+                   .arg(cam.state.liftB, 0, 'f', 3)
+                   .arg(cam.state.gammaR, 0, 'f', 3)
+                   .arg(cam.state.gammaB, 0, 'f', 3)
+                   .arg(cam.state.gammaY, 0, 'f', 3);
+    }
+    qInfo().noquote() << "lift/gamma pair: dE" << de0 << "\n  " << log.join(QStringLiteral("\n  "));
+    QVERIFY2(diff().sceneDe < 1.5, qPrintable(log.join(QStringLiteral("; "))));
+    QVERIFY2(std::fabs(cam.state.gammaB + cam.state.gammaY) < 0.2, qPrintable(log.join(QStringLiteral("; "))));
+}
+
+void TestMatchEngine::referenceMatchUnwindsCcGainSkew()
+{
+    // Stress 4 (18.11): CC gain R 1.30 / G 0.85 / B 0.75 with auto colour. The white balance alone can
+    // cancel the cast (live it went to 3450 K / tint -50 and left gain B at 0.61); with the CC unwind the
+    // CC gains return toward the reference's and the white balance stays near the light.
+    Scene scene;
+    const Scene chart = chartScene();
+    const double greys[16] = {0.008, 0.015, 0.025, 0.04, 0.06, 0.08, 0.11, 0.15, 0.2, 0.26, 0.33, 0.42, 0.52, 0.63, 0.75, 0.88};
+    for (int i = 0; i < 24; ++i) {
+        if (i % 3 == 2) {
+            scene.patchesLinear << chart.patchesLinear[(i * 7) % 18];
+        } else {
+            const double g = greys[(i * 2 / 3) % 16];
+            scene.neutral << scene.patchesLinear.size();
+            scene.patchesLinear << Rgb{g, g, g};
+        }
+    }
+    SimCamera ref;
+    ref.lightKelvin = 4000;
+    ref.state.whiteBalanceKelvin = 4000;
+    SimCamera cam = ref;
+    cam.state.gainR = 1.30f;
+    cam.state.gainG = 0.85f;
+    cam.state.gainB = 0.75f;
+    MatchEngine::Settings st;
+    st.liveLimits = false;
+    st.balanceVia = MatchEngine::BalanceVia::Auto;
+    st.lift = st.gamma = true;
+    const MatchEngine::SceneStats rs = MatchEngine::sceneStats(ref.render(scene), st.transfer);
+    const auto diff = [&] {
+        return MatchEngine::compareScenes(MatchEngine::sceneStats(cam.render(scene), st.transfer), rs, st.transfer);
+    };
+    const double de0 = diff().sceneDe;
+    QStringList log;
+    for (int pass = 0; pass < 8; ++pass) {
+        MatchEngine::Settings sm = st;
+        sm.unwindGain = true;
+        sm.unwindGainRB[0] = 1.0 / (double(cam.state.gainR) / cam.state.gainG);
+        sm.unwindGainRB[1] = 1.0 / (double(cam.state.gainB) / cam.state.gainG);
+        const MatchEngine::SceneStats cs = MatchEngine::sceneStats(cam.render(scene), st.transfer);
+        const MatchEngine::ReferenceMatch m = MatchEngine::referenceMatch(cs, rs, sm);
+        const MatchEngine::Delta d = MatchEngine::solve(m.pairs, sm);
+        cam.state = MatchEngine::compose(cam.state, d, sm);
+        log << QStringLiteral("dE %1 gain %2/%3/%4 WB %5/%6")
+                   .arg(diff().sceneDe, 0, 'f', 2)
+                   .arg(cam.state.gainR, 0, 'f', 3)
+                   .arg(cam.state.gainG, 0, 'f', 3)
+                   .arg(cam.state.gainB, 0, 'f', 3)
+                   .arg(cam.state.whiteBalanceKelvin)
+                   .arg(cam.state.whiteBalanceTint);
+    }
+    qInfo().noquote() << "cc skew: dE" << de0 << "\n  " << log.join(QStringLiteral("\n  "));
+    const QByteArray why = log.join(QStringLiteral("; ")).toUtf8();
+    QVERIFY(de0 > 5.0);
+    QVERIFY2(diff().sceneDe < 2.0, why.constData());
+    QVERIFY2(std::fabs(cam.state.gainR / cam.state.gainG - 1.0) < 0.1, why.constData());
+    QVERIFY2(std::fabs(cam.state.gainB / cam.state.gainG - 1.0) < 0.1, why.constData());
+    QVERIFY2(std::abs(cam.state.whiteBalanceKelvin - 4000) <= 600, why.constData());
 }
 
 QTEST_MAIN(TestMatchEngine)
