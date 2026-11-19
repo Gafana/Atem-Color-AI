@@ -6,6 +6,8 @@
 
 #include <QImage>
 #include <QRect>
+#include <QRectF>
+#include <QString>
 #include <QStringList>
 #include <QVector>
 
@@ -62,7 +64,31 @@ struct Settings
     /** Auto level may use the lens iris (false when the lens is not controllable / did not follow). */
     bool irisUsable = true;
     ColorScience::Transfer transfer = ColorScience::Transfer::Bt709Oetf;
+    /** Unwinding: lift and gamma can trade off over the measured range (live: a blue lift hid behind a
+     *  blue gamma -0.3 and stayed). When set, the per-channel fit is pulled toward the change that would
+     *  bring the camera's absolute R/G/B lift / gamma to these targets (the reference camera's values),
+     *  so the ambiguity resolves toward the reference instead of an equal-looking compensating pair. */
+    bool unwind = false;
+    double unwindLift[3] = {0, 0, 0};  ///< wanted delta lift per channel (reference - current)
+    double unwindGamma[3] = {0, 0, 0}; ///< wanted delta gamma per channel
+    /** Same for white balance vs CC gain (BalanceVia::Auto): both tint the picture, a skewed CC gain was
+     *  left in place and the white balance drifted to compensate (live: gain B 0.61 + 3450 K). The CC
+     *  part of the change first moves the camera's R/G and B/G CC gain ratios by these factors (toward
+     *  the reference's, ±25 % per pass), the white balance takes the rest. */
+    bool unwindGain = false;
+    double unwindGainRB[2] = {1.0, 1.0};
+    /** Exposure order (ExposureVia::Auto): when the sensor gain differs from this (the reference's dB) by a
+     *  whole step or more, the dB is aligned first, then the iris, then Gain Y. Live stress 7: a camera at
+     *  +12 dB was brought down by closing the iris and a negative Lift Y - noisy and with lifted blacks. */
+    int alignDb = kNoAlignDb;
+    /** The stats describe one uniform object (a white sheet zone): the level is its median ratio. */
+    bool objectZone = false;
+    static constexpr int kNoAlignDb = -1000;
 };
+
+/** Suggest a measurement zone on a white sheet / grey card in @p frame: the largest bright, near-neutral,
+ *  smooth area, shrunk to its interior. Returns a normalized rect (0..1) or an empty rect. */
+QRectF findWhiteSheet(const QImage &frame, QString *why = nullptr);
 
 /** Model of one channel of the camera primary grade on encoded signal x in [0,1]:
  *  y = (x*gain + lift*(1-x)) ^ (2^-gamma). Lift/gamma scale of the real camera is not documented
@@ -166,8 +192,36 @@ struct SceneStats
     double neutralFraction = 0;
     double keyLinear = 0;          ///< log-average luma (linear)
     double p25Linear = 0, p50Linear = 0, p75Linear = 0, p90Linear = 0, p98Linear = 0;
+    double p02Linear = 0, p05Linear = 0, p10Linear = 0, p95Linear = 0; ///< shadows / contrast
     double medianChroma = 0;       ///< median chroma (encoded) of mid-tone pixels after neutralising the light
+    /** Colour of near-neutral surfaces per tonal zone (0 shadows p2..p30, 1 mids p30..p70,
+     *  2 highlights p70..p98), linear, luma 1 - a different tint in the shadows than in the highlights
+     *  shows up here. Falls back to illuminantRaw when a zone has too few neutral pixels. */
+    Rgb zoneIll[3] = {{1.0, 1.0, 1.0}, {1.0, 1.0, 1.0}, {1.0, 1.0, 1.0}};
+    int zoneCount[3] = {0, 0, 0};
+    /** Saturation: CIELAB chroma C* of mid-tone pixels (L* 25..85) after neutralising the light and
+     *  normalising the exposure (median -> L* 50) - comparable between cameras and exposures. */
+    double chromaP50 = 0, chromaP75 = 0, chromaP90 = 0;
+    int chromaCount = 0;
+    /** Per-channel histogram percentiles (encoded) at kChannelQuantiles - the channel transfer curve of
+     *  the camera is fitted by matching them to the reference (robust to small framing differences). */
+    static constexpr int kChannelQ = 12;
+    double chQ[3][kChannelQ] = {};
 };
+
+/** How different two pictures look: tonal-zone colour, shadows, contrast and saturation. */
+struct SceneDiff
+{
+    bool valid = false;
+    double zoneDe[5] = {0, 0, 0, 0, 0}; ///< ΔE2000 of the zone colours at p5/p25/p50/p75/p95
+    double zoneDeMean = 0;
+    double medianDe = 0;  ///< ΔE2000 of the median colour (object metric: a uniform sheet / card zone)
+    double shadowIre[2] = {0, 0};       ///< p5 luma, camera / reference (IRE)
+    double contrastIre[2] = {0, 0};     ///< p95 - p5 luma, camera / reference (IRE)
+    double chroma75[2] = {0, 0};        ///< C* p75, camera / reference
+    double sceneDe = 0;                 ///< sqrt(zoneDeMean² + (ΔC*75 / 2)²) - single number for the loop
+};
+SceneDiff compareScenes(const SceneStats &cam, const SceneStats &ref, ColorScience::Transfer transfer);
 SceneStats sceneStats(const QImage &image, ColorScience::Transfer transfer, QStringList *notes = nullptr);
 
 struct ReferenceMatch
@@ -180,8 +234,12 @@ struct ReferenceMatch
  *  histograms are not comparable. Instead the colour of the light (white balance + tint), then the
  *  exposure (median / log-average level) and only then - if enabled - tone (lift/gamma from luma
  *  percentiles) and saturation (median chroma) are matched, each conservatively. */
+/** @p toneCamera / @p toneReference: optional whole-frame statistics for tone (lift/gamma), per-zone tint
+ *  and saturation when @p camera / @p reference describe a small marked zone (e.g. a white sheet: one
+ *  level, no shadows) - the zone then sets only white balance and level. */
 ReferenceMatch referenceMatch(const SceneStats &camera, const SceneStats &reference, const Settings &settings,
-                              QStringList *notes = nullptr);
+                              QStringList *notes = nullptr, const SceneStats *toneCamera = nullptr,
+                              const SceneStats *toneReference = nullptr);
 
 /** Automatic mode: pairs that neutralise the estimated illuminant and bring the scene key to
  *  @p targetGreyIre (mid-grey level, e.g. 41 IRE for 18 % grey through BT.709), protecting

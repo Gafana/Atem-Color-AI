@@ -13,6 +13,7 @@ class PreviewOverlayWidget final : public QWidget
 public:
     enum class Tool
     {
+        None, ///< whole-frame modes: nothing drawn, mouse does not edit
         GrayRect,
         ColorCheckerQuad,
     };
@@ -39,11 +40,14 @@ protected:
 
 private:
     QPointF mapFromWidget(const QPoint &pos) const;
+    /** Where the picture is drawn (letterboxed, aspect kept); zone coordinates are relative to it. */
+    QRectF imageRect() const;
+    QRectF toWidget(const QRectF &norm) const;
 
     QImage m_image;
     QImage m_scopeOverlay;
     bool m_scopeOverlayOn = false;
-    Tool m_tool = Tool::GrayRect;
+    Tool m_tool = Tool::None;
     QRectF m_grayRoi;
     QVector<QPointF> m_checker;
     bool m_dragging = false;

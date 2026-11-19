@@ -229,6 +229,11 @@ endif()
 add_executable(atem-color-ai ${APP_SOURCES})
 target_link_libraries(atem-color-ai PRIVATE atem_color ${QT_LIBS})
 target_compile_definitions(atem-color-ai PRIVATE QT_NO_KEYWORDS)
+if(MSVC)
+    # onCaptureAnalyze keeps several FrameColorAnalysis (6 x 256-bin histograms) values on the stack;
+    # with the default 1 MB main-thread stack a reference-mode capture overflowed (0xC00000FD).
+    target_link_options(atem-color-ai PRIVATE /STACK:8388608)
+endif()
 
 if(ENABLE_GUI)
     target_compile_definitions(atem-color-ai PRIVATE ENABLE_GUI)
