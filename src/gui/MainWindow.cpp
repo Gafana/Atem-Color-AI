@@ -20,6 +20,8 @@
 #include "color/ReferenceFrameStore.h"
 #include "platform/AtemPathValidation.h"
 #include "platform/AtemSetup.h"
+#include "control/VmixClient.h"
+#include "color/FrameAdvisor.h"
 
 #ifdef HAVE_GSTREAMER
 #include "capture/GstDeviceEnumerator.h"
@@ -102,7 +104,20 @@ bool isMappableInput(const AtemInputInfo &input)
         if (port.contains(word))
             return false;
     }
-    return true;
+    // vMix input types that are not cameras (https://www.vmix.com/help28/DeveloperAPI.html: type attribute)
+    static const QStringList vmixNonCamera = {QStringLiteral("blank"),      QStringLiteral("colour"),
+                                              QStringLiteral("xaml"),       QStringLiteral("title"),
+                                              QStringLiteral("gt"),         QStringLiteral("image"),
+                                              QStringLiteral("photos"),     QStringLiteral("powerpoint"),
+                                              QStringLiteral("audiofile"),  QStringLiteral("browser"),
+                                              QStringLiteral("virtualset"), QStringLiteral("mix")};
+    return !vmixNonCamera.contains(port);
+}
+
+std::unique_ptr<AtemClient> makeVmixClient()
+{
+    return createVmixClient([] { return AtemAppSettings::vmixCcCache(); },
+                            [](const QByteArray &json) { AtemAppSettings::setVmixCcCache(json); });
 }
 
 bool selectComboKey(QComboBox *box, const QString &key, bool allowFirst)
@@ -192,8 +207,15 @@ protected:
 MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp, QWidget *parent)
     : QMainWindow(parent)
     , m_client(std::move(client))
+    , m_atemIp(atemIp)
 {
     qRegisterMetaType<FrameColorAnalysis>();
+    if (AtemAppSettings::isVmixBackend()) {
+        // vMix mode: the ATEM client waits parked until the user switches back
+        m_backend = QStringLiteral("vmix");
+        m_parkedClient = std::move(m_client);
+        m_client = makeVmixClient();
+    }
     qRegisterMetaType<ScopeComputeRequest>();
     setWindowTitle(QStringLiteral("Atem Color AI"));
     resize(1480, 920);
@@ -329,10 +351,22 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     layout->addWidget(m_configBanner);
 
     auto *linkRow = new QHBoxLayout();
-    linkRow->addWidget(new QLabel(QStringLiteral("IP пульта:"), m_sourcePanel));
+    linkRow->addWidget(new QLabel(QStringLiteral("Управление:"), m_sourcePanel));
+    m_backendCombo = new QComboBox(m_sourcePanel);
+    m_backendCombo->setObjectName(QStringLiteral("backendCombo"));
+    m_backendCombo->addItem(QStringLiteral("ATEM (IP пульта)"), QStringLiteral("atem"));
+    m_backendCombo->addItem(QStringLiteral("vMix (адрес ПК)"), QStringLiteral("vmix"));
+    m_backendCombo->setToolTip(QStringLiteral(
+        "Чем управлять: пультом ATEM (параметры камер Blackmagic) или vMix (цветокоррекция входов через "
+        "HTTP API, по умолчанию localhost:8088). Работает один режим за раз."));
+    m_backendCombo->setCurrentIndex(isVmixMode() ? 1 : 0);
+    linkRow->addWidget(m_backendCombo);
+    m_addrLabel = new QLabel(isVmixMode() ? QStringLiteral("Адрес vMix:") : QStringLiteral("IP пульта:"), m_sourcePanel);
+    linkRow->addWidget(m_addrLabel);
     m_ipEdit = new QLineEdit(m_sourcePanel);
-    m_ipEdit->setPlaceholderText(QStringLiteral("192.168.10.240"));
-    m_ipEdit->setText(atemIp);
+    m_ipEdit->setObjectName(QStringLiteral("addressEdit"));
+    m_ipEdit->setPlaceholderText(isVmixMode() ? QStringLiteral("localhost:8088") : QStringLiteral("192.168.10.240"));
+    m_ipEdit->setText(isVmixMode() ? AtemAppSettings::vmixAddress() : atemIp);
     m_ipEdit->setClearButtonEnabled(true);
     linkRow->addWidget(m_ipEdit, 1);
     m_btnConnect = new QPushButton(QStringLiteral("Подключить"), m_sourcePanel);
@@ -367,14 +401,14 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     m_auxCombo = new QComboBox(m_sourcePanel);
     m_auxCombo->setMinimumWidth(160);
     routeRow->addWidget(m_auxCombo, 1);
-    auto *btnAuxPgm = new QPushButton(QStringLiteral("AUX = Программа"), m_sourcePanel);
-    btnAuxPgm->setToolTip(QStringLiteral("Вернуть на выбранный AUX программный выход (источник 10010)"));
-    routeRow->addWidget(btnAuxPgm);
-    connect(btnAuxPgm, &QPushButton::clicked, this, [this] {
+    m_btnAuxPgm = new QPushButton(QStringLiteral("AUX = Программа"), m_sourcePanel);
+    m_btnAuxPgm->setToolTip(QStringLiteral("Вернуть на выбранный AUX программный выход (источник 10010)"));
+    routeRow->addWidget(m_btnAuxPgm);
+    connect(m_btnAuxPgm, &QPushButton::clicked, this, [this] {
         if (!m_client || !m_client->isConnected() || m_busy || currentAuxId() == 0)
             return;
-        const QString err = m_client->setAuxSource(currentAuxId(), 10010);
-        statusBar()->showMessage(err.isEmpty() ? QStringLiteral("AUX → Программа") : err, 5000);
+        const QString err = m_client->setAuxSource(currentAuxId(), 10010); // vMix: Value=Output
+        statusBar()->showMessage(err.isEmpty() ? QStringLiteral("Выход → Программа") : err, 5000);
     });
     m_layoutCombo = new QComboBox(m_sourcePanel);
     for (const QString &layoutId : multiviewLayoutIds())
@@ -548,6 +582,15 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     paramRow->addWidget(m_chkUnlimited);
     paramRow->addStretch(1);
     cameraLayout->addLayout(paramRow);
+    m_vmixNote = new QLabel(QStringLiteral(
+        "vMix: меняется только цветокоррекция входа — Lift/Gamma/Gain R, G, B, Y, насыщенность, оттенок. "
+        "Баланс белого (K/tint), диафрагма, усиление dB и выдержка — только на камере: цвет и уровень "
+        "подстраиваются через Gain."), m_cameraPanel);
+    m_vmixNote->setObjectName(QStringLiteral("vmixNote"));
+    m_vmixNote->setWordWrap(true);
+    m_vmixNote->setStyleSheet(QStringLiteral("QLabel { color: #e0b050; }"));
+    m_vmixNote->setVisible(false);
+    cameraLayout->addWidget(m_vmixNote);
 
     // legacy widgets kept for settings compatibility (hidden)
     m_grayTargetSpin = new QSpinBox(m_cameraPanel);
@@ -691,7 +734,16 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     connect(m_ipEdit, &QLineEdit::editingFinished, this, [this] {
         if (!m_ipEdited)
             return;
-        AtemAppSettings::setIp(m_ipEdit->text());
+        if (isVmixMode()) {
+            AtemAppSettings::setVmixAddress(m_ipEdit->text());
+        } else {
+            AtemAppSettings::setIp(m_ipEdit->text());
+            m_atemIp = m_ipEdit->text().trimmed();
+        }
+    });
+    connect(m_backendCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index >= 0)
+            switchBackend(m_backendCombo->itemData(index).toString());
     });
     connect(btnRefresh, &QPushButton::clicked, this, &MainWindow::onRefreshDevices);
     connect(m_deviceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
@@ -826,6 +878,7 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
     loadMappingFromSettings();
     syncCamerasFromTable();
     loadCameraRois();
+    applyBackendUi();
     rebuildAtemAvailabilityUi();
 
     for (QComboBox *combo : findChildren<QComboBox *>())
@@ -858,11 +911,12 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
         if (m_client->isConnected())
             return;
         m_atemWasConnected = false;
-        qCWarning(lcRoute) << "ATEM connection lost";
+        qCWarning(lcRoute) << backendLabel() << "connection lost";
         m_client->disconnect();
         if (m_linkStatus)
-            m_linkStatus->setText(QStringLiteral("Связь с ATEM потеряна — проверьте сеть и нажмите «Подключить»"));
-        statusBar()->showMessage(QStringLiteral("Связь с ATEM потеряна"), 15000);
+            m_linkStatus->setText(QStringLiteral("Связь с %1 потеряна — проверьте сеть и нажмите «Подключить»")
+                                      .arg(backendLabel()));
+        statusBar()->showMessage(QStringLiteral("Связь с %1 потеряна").arg(backendLabel()), 15000);
         rebuildAtemAvailabilityUi();
     });
     linkTimer->start();
@@ -893,14 +947,99 @@ MainWindow::~MainWindow()
     }
 }
 
+bool MainWindow::isVmixMode() const
+{
+    return m_backend == QLatin1String("vmix");
+}
+
+QString MainWindow::backendLabel() const
+{
+    return isVmixMode() ? QStringLiteral("vMix") : QStringLiteral("ATEM");
+}
+
+bool MainWindow::controlAvailable() const
+{
+    return isVmixMode() || AtemSetup::isLiveAtemControlAvailable();
+}
+
+void MainWindow::switchBackend(const QString &backend)
+{
+    const QString wanted = backend == QLatin1String("vmix") ? QStringLiteral("vmix") : QStringLiteral("atem");
+    if (wanted == m_backend || m_closing.load())
+        return;
+    if (m_busy || m_loopPass > 0) {
+        QSignalBlocker block(m_backendCombo);
+        m_backendCombo->setCurrentIndex(isVmixMode() ? 1 : 0);
+        statusBar()->showMessage(QStringLiteral("Дождитесь окончания захвата"), 5000);
+        return;
+    }
+    // Separate modes, never both: disconnect the current backend and park its client.
+    if (m_client)
+        m_client->disconnect();
+    m_atemWasConnected = false;
+    std::unique_ptr<AtemClient> next = std::move(m_parkedClient);
+    m_parkedClient = std::move(m_client);
+    if (!next)
+        next = wanted == QLatin1String("vmix") ? makeVmixClient() : createAtemClient();
+    m_client = std::move(next);
+    m_backend = wanted;
+    AtemAppSettings::setControlBackend(wanted);
+    qCInfo(lcRoute).noquote() << QStringLiteral("control backend -> %1").arg(wanted);
+
+    m_ipEdited = false;
+    if (m_addrLabel)
+        m_addrLabel->setText(isVmixMode() ? QStringLiteral("Адрес vMix:") : QStringLiteral("IP пульта:"));
+    if (m_ipEdit) {
+        m_ipEdit->setPlaceholderText(isVmixMode() ? QStringLiteral("localhost:8088")
+                                                  : QStringLiteral("192.168.10.240"));
+        m_ipEdit->setText(isVmixMode() ? AtemAppSettings::vmixAddress() : m_atemIp);
+    }
+    if (m_linkStatus)
+        m_linkStatus->setText(QStringLiteral("Нет подключения"));
+    // inputs, outputs, camera map and presets belong to the backend
+    m_inputs.clear();
+    m_auxes.clear();
+    m_cameras.clear();
+    m_loopHistory.clear();
+    refreshAuxList();
+    loadMappingFromSettings();
+    syncCamerasFromTable();
+    rebuildPresetMenu();
+    applyBackendUi();
+    refreshCorrectionsTable();
+    rebuildAtemAvailabilityUi();
+    connectAtem(false);
+}
+
+void MainWindow::applyBackendUi()
+{
+    const bool vmix = isVmixMode();
+    if (m_mapTable)
+        m_mapTable->setHorizontalHeaderItem(1, new QTableWidgetItem(vmix ? QStringLiteral("Вход vMix")
+                                                                         : QStringLiteral("Вход ATEM")));
+    if (m_btnAuxPgm) {
+        m_btnAuxPgm->setText(vmix ? QStringLiteral("Выход = Программа") : QStringLiteral("AUX = Программа"));
+        m_btnAuxPgm->setToolTip(vmix ? QStringLiteral("Вернуть на выбранный выход vMix программу (Value=Output)")
+                                     : QStringLiteral("Вернуть на выбранный AUX программный выход (источник 10010)"));
+    }
+    if (m_auxCombo)
+        m_auxCombo->setToolTip(vmix ? QStringLiteral(
+                                          "Выход vMix, который идёт на карту захвата (Output 2/3/4 через SDI/NDI, "
+                                          "External 2 / виртуальная камера, Fullscreen). Перед кадром он "
+                                          "переключается на вход камеры и затем возвращается на программу.")
+                                    : QString());
+    updateRouteWidgets();
+    updateTuningPanelVisibility();
+}
+
 void MainWindow::rebuildAtemAvailabilityUi()
 {
-    const QString banner = AtemSetup::configurationBannerText();
+    const QString banner = isVmixMode() ? QString() : AtemSetup::configurationBannerText();
     if (m_configBanner) {
         m_configBanner->setText(banner);
         m_configBanner->setVisible(!banner.isEmpty());
     }
-    const bool atemOk = AtemSetup::isLiveAtemControlAvailable();
+    const bool atemOk = controlAvailable();
     if (m_btnApply) {
         m_btnApply->setEnabled(!m_busy && atemOk && m_client && m_client->isConnected());
         if (m_busy)
@@ -909,7 +1048,7 @@ void MainWindow::rebuildAtemAvailabilityUi()
             m_btnApply->setToolTip(QStringLiteral(
                 "Укажите корректный путь к ATEM Software Control в «Настройки → Пути ATEM…»"));
         else if (!m_client || !m_client->isConnected())
-            m_btnApply->setToolTip(QStringLiteral("Нет подключения к ATEM"));
+            m_btnApply->setToolTip(QStringLiteral("Нет подключения к %1").arg(backendLabel()));
         else
             m_btnApply->setToolTip(QString());
     }
@@ -946,9 +1085,19 @@ void MainWindow::connectAtem(bool persistIp)
 {
     if (m_closing.load() || !m_client)
         return;
-    const QString ip = m_ipEdit ? m_ipEdit->text().trimmed() : QString();
-    if (persistIp)
+    QString ip = m_ipEdit ? m_ipEdit->text().trimmed() : QString();
+    if (isVmixMode()) {
+        if (ip.isEmpty()) {
+            ip = QStringLiteral("localhost:8088"); // vMix default: this PC, Web Controller port
+            if (m_ipEdit)
+                m_ipEdit->setText(ip);
+        }
+        if (persistIp)
+            AtemAppSettings::setVmixAddress(ip);
+    } else if (persistIp) {
         AtemAppSettings::setIp(ip);
+        m_atemIp = ip;
+    }
     if (ip.isEmpty()) {
         if (m_linkStatus)
             m_linkStatus->setText(QStringLiteral("IP не задан"));
@@ -962,13 +1111,19 @@ void MainWindow::connectAtem(bool persistIp)
 
     const QString error = m_client->connectTo(ip);
     if (!error.isEmpty()) {
-        qCWarning(lcRoute).noquote() << QStringLiteral("ATEM connect %1 failed: %2").arg(ip, error);
+        qCWarning(lcRoute).noquote() << QStringLiteral("%1 connect %2 failed: %3").arg(backendLabel(), ip, error);
         m_inputs.clear();
         m_auxes.clear();
         refreshAuxList();
         if (m_linkStatus)
             m_linkStatus->setText(error);
-        QMessageBox::critical(this, QStringLiteral("Не удалось подключиться к ATEM"),
+        if (!persistIp && isVmixMode()) {
+            // start-up / mode switch: vMix may simply not be running yet - no modal dialog
+            statusBar()->showMessage(QStringLiteral("vMix не отвечает: %1").arg(error), 10000);
+            rebuildAtemAvailabilityUi();
+            return;
+        }
+        QMessageBox::critical(this, QStringLiteral("Не удалось подключиться к %1").arg(backendLabel()),
                               QStringLiteral("Адрес: %1\n\n%2").arg(ip, error));
         rebuildAtemAvailabilityUi();
         return;
@@ -1048,7 +1203,12 @@ void MainWindow::updateRouteWidgets()
         m_mapTable->setColumnHidden(2, route != QLatin1String("multiview"));
     if (!m_routeHelp)
         return;
-    if (route == QLatin1String("aux")) {
+    if (route == QLatin1String("aux") && isVmixMode()) {
+        m_routeHelp->setText(QStringLiteral(
+            "На карту должен приходить выбранный выход vMix (Output 2/3/4 через SDI/NDI, External 2 / виртуальная "
+            "камера, Fullscreen). Перед кадром он переключается на вход камеры и затем возвращается на программу "
+            "(Output). Эфир (Output 1 / стрим / запись) не трогается."));
+    } else if (route == QLatin1String("aux")) {
         m_routeHelp->setText(QStringLiteral(
             "На карту должен приходить выбранный выход AUX. Перед кадром он переключается на камеру "
             "и затем возвращается на прежний источник. Другие выходы и эфир не трогаются."));
@@ -1643,6 +1803,8 @@ void MainWindow::setBusy(bool busy)
         m_btnLoopUntil->setEnabled(!busy || m_loopPass > 0); // stays clickable as «Стоп»
     if (m_btnConnect)
         m_btnConnect->setEnabled(!busy);
+    if (m_backendCombo)
+        m_backendCombo->setEnabled(!busy);
     if (m_mapTable)
         m_mapTable->setEnabled(!busy);
     if (m_deviceCombo)
@@ -1695,7 +1857,9 @@ void MainWindow::onCaptureAnalyze()
         return;
     if (!m_client || !m_client->isConnected()) {
         QMessageBox::warning(this, QStringLiteral("Захват"),
-                             QStringLiteral("Нет подключения к ATEM. Проверьте IP пульта и нажмите «Подключить»."));
+                             isVmixMode() ? QStringLiteral("Нет подключения к vMix. Проверьте адрес (localhost:8088), "
+                                                           "включите Web Controller в vMix и нажмите «Подключить».")
+                                          : QStringLiteral("Нет подключения к ATEM. Проверьте IP пульта и нажмите «Подключить»."));
         return;
     }
     syncCamerasFromTable();
@@ -1712,7 +1876,8 @@ void MainWindow::onCaptureAnalyze()
     }
     if (kind == CaptureRouteKind::Aux && currentAuxId() == 0) {
         QMessageBox::warning(this, QStringLiteral("Захват"),
-                             QStringLiteral("Выберите выход AUX. Другой выход не будет выбран сам."));
+                             isVmixMode() ? QStringLiteral("Выберите выход vMix, который идёт на карту захвата.")
+                                          : QStringLiteral("Выберите выход AUX. Другой выход не будет выбран сам."));
         return;
     }
     if (kind == CaptureRouteKind::Multiview && currentLayout().isEmpty()) {
@@ -2117,6 +2282,8 @@ void MainWindow::runAiTips(const QStringList &problems, const QVector<bool> &act
         if (c.currentOk)
             opt.gainDb = c.current.gainDb;
         res.push_back(FrameAdvisor::analyze(c.lastFrame, c.grayRoi, opt));
+        if (isVmixMode())
+            FrameAdvisor::adaptForVmix(res.last());
         camIndex.push_back(i);
     }
     const int refPos = camIndex.indexOf(m_referenceIndex);
@@ -2127,9 +2294,13 @@ void MainWindow::runAiTips(const QStringList &problems, const QVector<bool> &act
             continue;
         double d = qQNaN();
         cross[k] = FrameAdvisor::compare(res.at(k), res.at(refPos), &d);
+        if (isVmixMode())
+            FrameAdvisor::adaptForVmix(cross[k]);
         de[k] = d;
     }
-    QString header = QStringLiteral("ATEM: AUX переключался по %1 камерам и возвращён обратно").arg(res.size());
+    QString header = isVmixMode()
+                         ? QStringLiteral("vMix: выход переключался по %1 входам и возвращён на программу").arg(res.size())
+                         : QStringLiteral("ATEM: AUX переключался по %1 камерам и возвращён обратно").arg(res.size());
     if (refPos >= 0)
         header += QStringLiteral("; эталон — %1").arg(res.at(refPos).label);
     if (!problems.isEmpty())
@@ -2173,12 +2344,12 @@ void MainWindow::onApply()
 {
     if (m_busy)
         return;
-    if (!AtemSetup::isLiveAtemControlAvailable()) {
+    if (!controlAvailable()) {
         QMessageBox::warning(this, QString(), QStringLiteral("Настройте путь к ATEM Software Control"));
         return;
     }
     if (!m_client || !m_client->isConnected()) {
-        QMessageBox::warning(this, QString(), QStringLiteral("Нет подключения к ATEM"));
+        QMessageBox::warning(this, QString(), QStringLiteral("Нет подключения к %1").arg(backendLabel()));
         return;
     }
     syncCamerasFromTable();
@@ -2210,8 +2381,9 @@ void MainWindow::onApply()
                 anyWarning = true;
             }
         } else {
-            text += m_chkAutoIris && m_chkAutoIris->isChecked() ? QStringLiteral(": авто ББ + авто диафрагма")
-                                                                : QStringLiteral(": авто ББ");
+            text += isVmixMode() ? QStringLiteral(": авто цветокоррекция vMix")
+                    : m_chkAutoIris && m_chkAutoIris->isChecked() ? QStringLiteral(": авто ББ + авто диафрагма")
+                                                                  : QStringLiteral(": авто ББ");
         }
         auto *item = new QListWidgetItem(text, list);
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
@@ -2222,8 +2394,12 @@ void MainWindow::onApply()
     }
     lay->addWidget(new QLabel(anyWarning ? QStringLiteral("⚠ Некоторые значения выглядят слишком большими — проверьте "
                                                           "кадр/разметку. Снимите галочки, чтобы не применять.")
-                                         : (camAuto ? QStringLiteral("Отмеченные камеры сами подберут баланс белого. "
-                                                                     "«Откат» вернёт прежние значения.")
+                                         : (camAuto ? (isVmixMode()
+                                                           ? QStringLiteral("vMix выполнит «Basic Auto Colour Correction» "
+                                                                            "для отмеченных входов (ColourCorrectionAuto). "
+                                                                            "«Откат» вернёт значения, отправленные этой программой.")
+                                                           : QStringLiteral("Отмеченные камеры сами подберут баланс белого. "
+                                                                            "«Откат» вернёт прежние значения."))
                                                     : QStringLiteral("Отмеченные камеры получат новые значения (откат доступен).")),
                               &dlg));
     lay->addWidget(list, 1);
@@ -2285,7 +2461,7 @@ int MainWindow::sendProposals(const QVector<int> &chosen, QString *errorsOut)
             }
             QString e = m_client->triggerCameraAction(camera.binding.atemId, BmdCameraProtocol::kCategoryVideo,
                                                       BmdCameraProtocol::kVideoAutoWhiteBalance);
-            if (e.isEmpty() && m_chkAutoIris && m_chkAutoIris->isChecked())
+            if (e.isEmpty() && !isVmixMode() && m_chkAutoIris && m_chkAutoIris->isChecked())
                 e = m_client->triggerCameraAction(camera.binding.atemId, BmdCameraProtocol::kCategoryLens,
                                                   BmdCameraProtocol::kLensAutoAperture);
             qCInfo(lcRoute).noquote() << QStringLiteral("camera auto dest=%1 %2")
@@ -2385,8 +2561,9 @@ void MainWindow::onAutoMatchLoop()
                                  QStringLiteral("В режиме встроенного автобаланса используйте «Применить»."));
         return;
     }
-    if (!AtemSetup::isLiveAtemControlAvailable() || !m_client || !m_client->isConnected()) {
-        QMessageBox::warning(this, QStringLiteral("Авто-подгонка"), QStringLiteral("Нет подключения к ATEM"));
+    if (!controlAvailable() || !m_client || !m_client->isConnected()) {
+        QMessageBox::warning(this, QStringLiteral("Авто-подгонка"),
+                             QStringLiteral("Нет подключения к %1").arg(backendLabel()));
         return;
     }
     {
@@ -2697,8 +2874,16 @@ void MainWindow::updateTuningPanelVisibility()
                                                         m_strengthSpin, m_chkUnlimited})
         if (w)
             w->setVisible(!camAuto);
+    const bool vmix = isVmixMode();
     if (m_chkAutoIris)
-        m_chkAutoIris->setVisible(camAuto);
+        m_chkAutoIris->setVisible(camAuto && !vmix);
+    // vMix: colour and level always through CC Gain (no WB / dB / iris) - the «через …» choice is hidden,
+    // the stored ATEM choice stays untouched for when ATEM is selected again
+    for (QComboBox *combo : {m_balanceViaCombo, m_exposureViaCombo})
+        if (combo && vmix)
+            combo->setVisible(false);
+    if (m_vmixNote)
+        m_vmixNote->setVisible(vmix);
     if (m_targetIreSpin)
         m_targetIreSpin->setVisible(m == ColorMatchMode::NeutralBalance || m == ColorMatchMode::GrayCard
                                     || (m == ColorMatchMode::CommonSample && m_sampleTargetCombo
@@ -2706,7 +2891,10 @@ void MainWindow::updateTuningPanelVisibility()
     if (m_btnCapture)
         m_btnCapture->setEnabled(!camAuto && !m_busy);
     if (m_modeHint)
-        m_modeHint->setText(colorMatchModeHint(m));
+        m_modeHint->setText(camAuto && isVmixMode()
+                                ? QStringLiteral("vMix: встроенная автоцветокоррекция входа «Basic Auto Colour Correction» "
+                                                 "(ColourCorrectionAuto). Захват не нужен — нажмите «Применить».")
+                                : colorMatchModeHint(m));
     if (m_previewOverlay) {
         m_previewOverlay->setTool(checker ? PreviewOverlayWidget::Tool::ColorCheckerQuad
                                           : PreviewOverlayWidget::Tool::GrayRect);
@@ -2962,7 +3150,7 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
         }
         QStringList notes = d.notes;
         MatchEngine::Settings sc = s;
-        sc.irisUsable = !cam.irisUnresponsive;
+        sc.irisUsable = s.irisUsable && !cam.irisUnresponsive;
         cam.proposed = MatchEngine::compose(cam.current, d, sc, &notes);
         cam.notes << notes;
         cam.errBefore = d.rmsBeforeIre;
@@ -3158,7 +3346,7 @@ void MainWindow::runMatchingAfterCapture(const QStringList &problems)
                     pre << QStringLiteral("по объекту (область на обеих камерах): цвет и уровень — по области, "
                                           "лифт/гамма/насыщенность/контраст — как у эталона, весь кадр — только для справки");
                 }
-                if (refIndex >= 0 && m_cameras.at(refIndex).currentOk)
+                if (!isVmixMode() && refIndex >= 0 && m_cameras.at(refIndex).currentOk)
                     sm.alignDb = m_cameras.at(refIndex).current.gainDb;
                 MatchEngine::SceneDiff sd;
                 if (m_tuningMode == ColorMatchMode::ReferenceCamera || m_tuningMode == ColorMatchMode::ReferenceFrame)
@@ -3637,6 +3825,13 @@ MatchEngine::Settings MainWindow::engineSettings() const
     s.strength = (m_strengthSpin ? m_strengthSpin->value() : 100) / 100.0;
     // per-pass limits (the closed loop converges); off in the test mode «Без ограничений»
     s.liveLimits = !unlimitedMode();
+    if (isVmixMode()) {
+        // vMix has only input colour correction: colour and level go through CC Gain, no WB / dB / iris
+        s.balanceVia = MatchEngine::BalanceVia::CcGain;
+        s.exposureVia = MatchEngine::ExposureVia::CcGain;
+        s.alignDb = MatchEngine::Settings::kNoAlignDb;
+        s.irisUsable = false;
+    }
     return s;
 }
 
@@ -3747,7 +3942,7 @@ void MainWindow::readCurrentCameraValues()
 void MainWindow::onSaveCameraPreset()
 {
     if (!m_client || !m_client->isConnected()) {
-        QMessageBox::warning(this, QStringLiteral("Пресеты"), QStringLiteral("Нет подключения к ATEM"));
+        QMessageBox::warning(this, QStringLiteral("Пресеты"), QStringLiteral("Нет подключения к %1").arg(backendLabel()));
         return;
     }
     syncCamerasFromTable();
@@ -3802,7 +3997,7 @@ void MainWindow::applyCameraPreset(const QString &name)
     if (!CameraPresetStore::find(name, &preset))
         return;
     if (!m_client || !m_client->isConnected()) {
-        QMessageBox::warning(this, QStringLiteral("Пресеты"), QStringLiteral("Нет подключения к ATEM"));
+        QMessageBox::warning(this, QStringLiteral("Пресеты"), QStringLiteral("Нет подключения к %1").arg(backendLabel()));
         return;
     }
     syncCamerasFromTable();

@@ -16,16 +16,18 @@ set(ATEM_SDK_DIR "" CACHE PATH "Path to locally installed Blackmagic ATEM Switch
 set(GSTREAMER_ROOT "" CACHE PATH "GStreamer MSVC prefix for Windows bundling (e.g. C:/gstreamer/1.0/msvc_x86_64)")
 
 set(QT_MIN_VERSION 5.15)
-find_package(Qt6 COMPONENTS Core Gui Widgets Test QUIET)
+find_package(Qt6 COMPONENTS Core Gui Widgets Network Test QUIET)
 if(Qt6_FOUND)
     set(QT_VERSION_MAJOR 6)
     set(QT_LIBS Qt6::Core Qt6::Gui)
     set(QT_TEST_LIBS Qt6::Test)
+    set(QT_NETWORK_LIB Qt6::Network)
 else()
-    find_package(Qt5 ${QT_MIN_VERSION} REQUIRED COMPONENTS Core Gui Widgets Test)
+    find_package(Qt5 ${QT_MIN_VERSION} REQUIRED COMPONENTS Core Gui Widgets Network Test)
     set(QT_VERSION_MAJOR 5)
     set(QT_LIBS Qt5::Core Qt5::Gui)
     set(QT_TEST_LIBS Qt5::Test)
+    set(QT_NETWORK_LIB Qt5::Network)
 endif()
 
 if(ENABLE_GUI)
@@ -146,6 +148,15 @@ target_link_libraries(atem_color PUBLIC ${QT_LIBS})
 target_include_directories(atem_color PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(atem_color PUBLIC QT_NO_KEYWORDS)
 
+# vMix control backend (documented HTTP Web API): https://www.vmix.com/help28/DeveloperAPI.html
+add_library(atem_vmix STATIC
+    src/control/VmixProtocol.h
+    src/control/VmixProtocol.cpp
+    src/control/VmixClient.h
+    src/control/VmixClient.cpp
+)
+target_link_libraries(atem_vmix PUBLIC atem_color ${QT_NETWORK_LIB})
+
 set(APP_SOURCES
     src/main.cpp
     src/atem/AtemClient.h
@@ -231,7 +242,7 @@ if(WIN32)
 endif()
 
 add_executable(atem-color-ai ${APP_SOURCES})
-target_link_libraries(atem-color-ai PRIVATE atem_color ${QT_LIBS})
+target_link_libraries(atem-color-ai PRIVATE atem_color atem_vmix ${QT_LIBS})
 target_compile_definitions(atem-color-ai PRIVATE QT_NO_KEYWORDS)
 if(MSVC)
     # onCaptureAnalyze keeps several FrameColorAnalysis (6 x 256-bin histograms) values on the stack;
@@ -398,4 +409,17 @@ if(BUILD_TESTING)
     target_link_libraries(tst_frameadvisor PRIVATE atem_color ${QT_TEST_LIBS})
     target_compile_definitions(tst_frameadvisor PRIVATE QT_NO_KEYWORDS)
     add_test(NAME frameadvisor COMMAND tst_frameadvisor)
+
+    add_executable(tst_vmix tests/tst_vmix.cpp tests/support/FakeVmixServer.h
+        src/platform/AtemAppSettings.cpp
+        src/platform/CameraPresetStore.cpp)
+    target_include_directories(tst_vmix PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(tst_vmix PRIVATE atem_vmix ${QT_NETWORK_LIB} ${QT_TEST_LIBS})
+    target_compile_definitions(tst_vmix PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME vmix COMMAND tst_vmix)
+
+    # Dev helper (not installed): fake vMix Web API on localhost:8088 to demo the vMix mode without vMix.
+    add_executable(fake-vmix tools/fake_vmix.cpp tests/support/FakeVmixServer.h)
+    target_link_libraries(fake-vmix PRIVATE ${QT_LIBS} ${QT_NETWORK_LIB})
+    target_compile_definitions(fake-vmix PRIVATE QT_NO_KEYWORDS)
 endif()

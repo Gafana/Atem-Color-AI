@@ -168,6 +168,44 @@ void setValue(const QString &key, const QVariant &v)
     });
 }
 
+QString controlBackend()
+{
+    return groupValue("control", "backend").trimmed() == QLatin1String("vmix") ? QStringLiteral("vmix")
+                                                                               : QStringLiteral("atem");
+}
+
+void setControlBackend(const QString &backend)
+{
+    setGroupValue("control", "backend", backend == QLatin1String("vmix") ? QStringLiteral("vmix")
+                                                                         : QStringLiteral("atem"));
+}
+
+bool isVmixBackend()
+{
+    return controlBackend() == QLatin1String("vmix");
+}
+
+QString vmixAddress()
+{
+    const QString a = groupValue("vmix", "address").trimmed();
+    return a.isEmpty() ? QStringLiteral("localhost:8088") : a;
+}
+
+void setVmixAddress(const QString &address)
+{
+    setGroupValue("vmix", "address", address.trimmed());
+}
+
+QByteArray vmixCcCache()
+{
+    return groupValue("vmix", "ccCache").toUtf8();
+}
+
+void setVmixCcCache(const QByteArray &json)
+{
+    setGroupValue("vmix", "ccCache", QString::fromUtf8(json));
+}
+
 QString ip()
 {
     return groupValue(kGroup, "ip").trimmed();
@@ -220,12 +258,16 @@ void setCaptureRoute(const QString &route)
 
 qint64 auxOutputId()
 {
-    return groupValue("capture", "auxId").toLongLong();
+    // vMix outputs and ATEM AUX ids are different things: kept separately
+    return isVmixBackend() ? groupValue("vmix", "auxId").toLongLong() : groupValue("capture", "auxId").toLongLong();
 }
 
 void setAuxOutputId(qint64 id)
 {
-    setGroupValue("capture", "auxId", id);
+    if (isVmixBackend())
+        setGroupValue("vmix", "auxId", id);
+    else
+        setGroupValue("capture", "auxId", id);
 }
 
 QString multiviewLayout()
@@ -241,7 +283,8 @@ void setMultiviewLayout(const QString &layoutId)
 QVector<CameraBinding> cameraMap()
 {
     QVector<CameraBinding> rows;
-    const QJsonDocument doc = QJsonDocument::fromJson(groupValue("mapping", "cameras").toUtf8());
+    const QJsonDocument doc = QJsonDocument::fromJson(
+        (isVmixBackend() ? groupValue("vmix", "cameras") : groupValue("mapping", "cameras")).toUtf8());
     if (!doc.isArray())
         return rows;
     for (const QJsonValue &value : doc.array()) {
@@ -269,7 +312,11 @@ void setCameraMap(const QVector<CameraBinding> &rows)
         object.insert(QStringLiteral("tune"), row.includeInTuning);
         array.append(object);
     }
-    setGroupValue("mapping", "cameras", QString::fromUtf8(QJsonDocument(array).toJson(QJsonDocument::Compact)));
+    const QString json = QString::fromUtf8(QJsonDocument(array).toJson(QJsonDocument::Compact));
+    if (isVmixBackend()) // vMix input numbers are not ATEM inputs: separate camera map
+        setGroupValue("vmix", "cameras", json);
+    else
+        setGroupValue("mapping", "cameras", json);
 }
 
 QString tuningMode()

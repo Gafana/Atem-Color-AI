@@ -20,6 +20,7 @@ QString writeAll(const QVector<CameraPreset> &all)
     for (const CameraPreset &p : all) {
         QJsonObject o;
         o.insert(QStringLiteral("name"), p.name);
+        o.insert(QStringLiteral("backend"), p.backend.isEmpty() ? QStringLiteral("atem") : p.backend);
         o.insert(QStringLiteral("saved"), p.saved.toString(Qt::ISODate));
         QJsonArray cams;
         for (const CameraPresetEntry &e : p.cameras) {
@@ -49,7 +50,23 @@ QString filePath()
     return QFileInfo(AtemAppSettings::settingsFilePath()).absolutePath() + QStringLiteral("/camera-presets.json");
 }
 
+namespace {
+QString current()
+{
+    return AtemAppSettings::controlBackend();
+}
+} // namespace
+
 QVector<CameraPreset> loadAll()
+{
+    QVector<CameraPreset> out;
+    for (const CameraPreset &p : loadAllBackends())
+        if (p.backend == current())
+            out.push_back(p);
+    return out;
+}
+
+QVector<CameraPreset> loadAllBackends()
 {
     QVector<CameraPreset> out;
     QFile f(filePath());
@@ -60,6 +77,9 @@ QVector<CameraPreset> loadAll()
         const QJsonObject o = v.toObject();
         CameraPreset p;
         p.name = o.value(QStringLiteral("name")).toString();
+        p.backend = o.value(QStringLiteral("backend")).toString(QStringLiteral("atem"));
+        if (p.backend.isEmpty())
+            p.backend = QStringLiteral("atem");
         p.saved = QDateTime::fromString(o.value(QStringLiteral("saved")).toString(), Qt::ISODate);
         for (const QJsonValue &cv : o.value(QStringLiteral("cameras")).toArray()) {
             const QJsonObject c = cv.toObject();
@@ -99,24 +119,27 @@ QString save(const CameraPreset &preset)
 {
     if (preset.name.trimmed().isEmpty())
         return QStringLiteral("Пустое имя пресета");
-    QVector<CameraPreset> all = loadAll();
+    CameraPreset stored = preset;
+    if (stored.backend.isEmpty())
+        stored.backend = current();
+    QVector<CameraPreset> all = loadAllBackends();
     bool replaced = false;
     for (CameraPreset &p : all) {
-        if (p.name == preset.name) {
-            p = preset;
+        if (p.name == stored.name && p.backend == stored.backend) {
+            p = stored;
             replaced = true;
         }
     }
     if (!replaced)
-        all.push_back(preset);
+        all.push_back(stored);
     return writeAll(all);
 }
 
 QString remove(const QString &name)
 {
-    QVector<CameraPreset> all = loadAll();
+    QVector<CameraPreset> all = loadAllBackends();
     for (int i = 0; i < all.size(); ++i) {
-        if (all.at(i).name == name) {
+        if (all.at(i).name == name && all.at(i).backend == current()) {
             all.removeAt(i);
             return writeAll(all);
         }
@@ -128,12 +151,12 @@ QString rename(const QString &from, const QString &to)
 {
     if (to.trimmed().isEmpty())
         return QStringLiteral("Пустое имя");
-    QVector<CameraPreset> all = loadAll();
+    QVector<CameraPreset> all = loadAllBackends();
     for (const CameraPreset &p : all)
-        if (p.name == to)
+        if (p.name == to && p.backend == current())
             return QStringLiteral("Пресет «%1» уже есть").arg(to);
     for (CameraPreset &p : all) {
-        if (p.name == from) {
+        if (p.name == from && p.backend == current()) {
             p.name = to;
             return writeAll(all);
         }
