@@ -13,6 +13,8 @@
 #include "scopes/ScopeTypes.h"
 
 #include <QMainWindow>
+#include <QPointer>
+#include <QRectF>
 
 #include <atomic>
 #include <functional>
@@ -30,6 +32,7 @@ class QDockWidget;
 class ScopeComputeWorker;
 class QThread;
 class CaptureJob;
+class AiTipsWidget;
 class DeviceScanThread;
 class GstLivePreview;
 
@@ -97,6 +100,8 @@ private Q_SLOTS:
     void onGrayRoiEdited(const QRectF &roi);
     void onCheckerRoiEdited(const QVector<QPointF> &corners);
     void onParamMaskChanged();
+    void onAiTipsAnalyze();
+    void updateAiTipsMarks();
 
 private:
     struct CameraRow
@@ -276,6 +281,11 @@ private:
     QLabel *m_markLabel = nullptr;
     QPushButton *m_btnClearZone = nullptr;
     QPushButton *m_btnFindSheet = nullptr;
+    QPointer<AiTipsWidget> m_aiTips;   ///< «ИИ-подсказки» panel (lives in a scope dock)
+    bool m_captureForAdvice = false;   ///< current capture feeds «ИИ-подсказки», not matching
+    QRectF m_inputRoi;                 ///< zone drawn when no camera is selected (no ATEM)
+    QRectF scopeZone() const;
+    void runAiTips(const QStringList &problems, const QVector<bool> &active);
     class QMenu *m_presetMenu = nullptr;
     bool m_atemWasConnected = false;
 

@@ -6,6 +6,7 @@
 #include "gui/docks/ScopeDockManager.h"
 #include "gui/docks/ScopeInstrumentWidget.h"
 #include "gui/scopes/ScopeSettingsDialog.h"
+#include "AiTipsWidget.h"
 #include "PreviewOverlayWidget.h"
 
 #include "capture/CaptureRoute.h"
@@ -65,6 +66,7 @@
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QPixmap>
+#include <QPolygonF>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSpinBox>
@@ -653,6 +655,17 @@ MainWindow::MainWindow(std::unique_ptr<AtemClient> client, const QString &atemIp
 
     m_previewOverlay = new PreviewOverlayWidget();
     m_scopeDocks = new ScopeDockManager(this, m_previewOverlay, this);
+    m_scopeDocks->setAiTipsFactory([this]() -> QWidget * {
+        auto *w = new AiTipsWidget();
+        m_aiTips = w;
+        connect(w, &AiTipsWidget::analyzeRequested, this, &MainWindow::onAiTipsAnalyze);
+        connect(w, &AiTipsWidget::marksChanged, this, &MainWindow::updateAiTipsMarks);
+        connect(w, &QObject::destroyed, this, [this] {
+            if (m_previewOverlay && !m_closing.load())
+                m_previewOverlay->setAdviceMarks({});
+        });
+        return w;
+    });
     m_scopeDocks->ensurePreviewDock();
 
     m_sourceDock = new QDockWidget(QStringLiteral("Источник"), this);
@@ -1998,7 +2011,14 @@ void MainWindow::finishCapture(CaptureJob *job)
         job->deleteLater();
 
     setBusy(false);
+    const bool forAdvice = m_captureForAdvice;
+    m_captureForAdvice = false;
     if (!outcome.fatal.isEmpty()) {
+        if (forAdvice) {
+            if (m_aiTips)
+                m_aiTips->setBusy(false, QStringLiteral("Захват не удался: %1").arg(outcome.fatal));
+            return;
+        }
         if (m_loopPass > 0)
             finishAutoMatchLoop(outcome.fatal);
         QMessageBox::warning(this, QStringLiteral("Захват"), outcome.fatal);
@@ -2030,7 +2050,123 @@ void MainWindow::finishCapture(CaptureJob *job)
     }
 
     readCurrentCameraValues();
+    if (forAdvice) {
+        runAiTips(problems, job ? job->request.active : QVector<bool>());
+        return;
+    }
     runMatchingAfterCapture(problems);
+}
+
+void MainWindow::onAiTipsAnalyze()
+{
+    if (!m_aiTips)
+        return;
+    if (m_busy) {
+        m_aiTips->setBusy(false, QStringLiteral("Занято: идёт захват / подстройка — повторите после"));
+        return;
+    }
+    syncCamerasFromTable();
+    const CaptureRouteKind kind = captureRouteKind(currentRoute());
+    bool atem = m_client && m_client->isConnected() && !m_cameras.isEmpty() && kind == CaptureRouteKind::Aux
+                && currentAuxId() != 0 && captureActiveMask().contains(true);
+#ifdef HAVE_GSTREAMER
+    atem = atem && m_preview && m_preview->isRunning();
+#else
+    atem = false;
+#endif
+    if (!atem) {
+        // no ATEM (or no cameras / not on AUX): the picture that is on the input right now
+        if (m_lastPreviewFrame.isNull()) {
+            m_aiTips->setBusy(false, QStringLiteral("Нет кадра на входе"));
+            return;
+        }
+        FrameAdvisor::Options opt;
+        opt.label = QStringLiteral("Вход");
+        opt.targetIre = m_targetIreSpin ? m_targetIreSpin->value() : opt.targetIre;
+        const FrameAdvisor::Advice a = FrameAdvisor::analyze(m_lastPreviewFrame, scopeZone(), opt);
+        m_aiTips->setResults({a}, {}, {},
+                             QStringLiteral("Без ATEM: анализ текущего кадра с входа (%1)")
+                                 .arg(a.zone ? QStringLiteral("зона") : QStringLiteral("весь кадр")));
+        m_aiTips->setBusy(false);
+        qCInfo(lcRoute).noquote() << QStringLiteral("ai tips input: %1").arg(a.verdict());
+        return;
+    }
+    m_aiTips->setBusy(true, QStringLiteral("Переключаю AUX по отмеченным камерам…"));
+    m_captureForAdvice = true;
+    onCaptureAnalyze();
+    if (!m_busy) { // refused before starting (message already shown)
+        m_captureForAdvice = false;
+        m_aiTips->setBusy(false, QStringLiteral("Захват не запущен"));
+    }
+}
+
+void MainWindow::runAiTips(const QStringList &problems, const QVector<bool> &active)
+{
+    if (!m_aiTips)
+        return;
+    QVector<FrameAdvisor::Advice> res;
+    QVector<int> camIndex;
+    const double target = m_targetIreSpin ? m_targetIreSpin->value() : 45.0;
+    for (int i = 0; i < m_cameras.size(); ++i) {
+        const CameraRow &c = m_cameras.at(i);
+        if ((!active.isEmpty() && !active.value(i, false)) || c.lastFrame.isNull())
+            continue;
+        FrameAdvisor::Options opt;
+        opt.label = c.binding.label;
+        opt.targetIre = target;
+        if (c.currentOk)
+            opt.gainDb = c.current.gainDb;
+        res.push_back(FrameAdvisor::analyze(c.lastFrame, c.grayRoi, opt));
+        camIndex.push_back(i);
+    }
+    const int refPos = camIndex.indexOf(m_referenceIndex);
+    QVector<QVector<FrameAdvisor::Issue>> cross(res.size());
+    QVector<double> de(res.size(), qQNaN());
+    for (int k = 0; k < res.size(); ++k) {
+        if (refPos < 0 || k == refPos)
+            continue;
+        double d = qQNaN();
+        cross[k] = FrameAdvisor::compare(res.at(k), res.at(refPos), &d);
+        de[k] = d;
+    }
+    QString header = QStringLiteral("ATEM: AUX переключался по %1 камерам и возвращён обратно").arg(res.size());
+    if (refPos >= 0)
+        header += QStringLiteral("; эталон — %1").arg(res.at(refPos).label);
+    if (!problems.isEmpty())
+        header += QStringLiteral("; ошибки: ") + problems.join(QStringLiteral("; "));
+    m_aiTips->setResults(res, cross, de, header);
+    m_aiTips->setBusy(false);
+    for (int k = 0; k < res.size(); ++k)
+        qCInfo(lcRoute).noquote() << QStringLiteral("ai tips %1: %2 dE %3")
+                                         .arg(res.at(k).label, res.at(k).verdict())
+                                         .arg(de.at(k), 0, 'f', 2);
+}
+
+void MainWindow::updateAiTipsMarks()
+{
+    if (!m_previewOverlay)
+        return;
+    QVector<PreviewOverlayWidget::Mark> marks;
+    if (m_aiTips && m_aiTips->marksEnabled()) {
+        const int k = m_aiTips->markedSource();
+        if (k >= 0 && k < m_aiTips->results().size()) {
+            const FrameAdvisor::Advice &a = m_aiTips->results().at(k);
+            for (const FrameAdvisor::Issue &is : a.issues) {
+                const QColor col = is.severity == FrameAdvisor::Severity::Critical ? QColor(255, 70, 70)
+                                   : is.severity == FrameAdvisor::Severity::Warning ? QColor(255, 180, 60)
+                                                                                    : QColor(130, 180, 255);
+                int n = 0;
+                for (const QRectF &r : is.regions) {
+                    marks.push_back({r, col,
+                                     n == 0 ? QStringLiteral("%1: %2").arg(a.label, is.text.section(QLatin1Char(':'), 0, 0))
+                                            : QString()});
+                    if (++n >= 3)
+                        break;
+                }
+            }
+        }
+    }
+    m_previewOverlay->setAdviceMarks(marks);
 }
 
 void MainWindow::onApply()
@@ -2539,7 +2675,11 @@ void MainWindow::updateTuningPanelVisibility()
         m_btnSaveRef->setVisible(refFrame);
     if (m_btnLoadRef)
         m_btnLoadRef->setVisible(refFrame);
-    const bool marking = roiMode || checker || m == ColorMatchMode::ReferenceCamera;
+    // A zone can be drawn in every mode: in zone modes it is the measurement area for matching, in
+    // whole-frame modes (neutral balance, reference frame, camera auto) matching still uses the whole
+    // frame and the zone only drives the scopes and «ИИ-подсказки».
+    const bool marking = true;
+    Q_UNUSED(roiMode);
     if (m_markCameraCombo)
         m_markCameraCombo->setVisible(marking);
     if (m_markLabel)
@@ -2568,15 +2708,13 @@ void MainWindow::updateTuningPanelVisibility()
     if (m_modeHint)
         m_modeHint->setText(colorMatchModeHint(m));
     if (m_previewOverlay) {
-        // whole-frame modes: no zone on the preview and no accidental drawing with the mouse
-        m_previewOverlay->setTool(checker   ? PreviewOverlayWidget::Tool::ColorCheckerQuad
-                                  : marking ? PreviewOverlayWidget::Tool::GrayRect
-                                            : PreviewOverlayWidget::Tool::None);
+        m_previewOverlay->setTool(checker ? PreviewOverlayWidget::Tool::ColorCheckerQuad
+                                          : PreviewOverlayWidget::Tool::GrayRect);
     }
     if (m_btnClearZone)
         m_btnClearZone->setVisible(marking);
     if (m_btnFindSheet)
-        m_btnFindSheet->setVisible(marking && m_tuningMode != ColorMatchMode::ColorChecker);
+        m_btnFindSheet->setVisible(m_tuningMode != ColorMatchMode::ColorChecker);
     applyOverlayForMarkCamera();
 }
 
@@ -2613,7 +2751,7 @@ void MainWindow::applyOverlayForMarkCamera()
         m_previewOverlay->setCheckerCorners(camera.checkerCorners);
         return;
     }
-    m_previewOverlay->setGrayRoi({});
+    m_previewOverlay->setGrayRoi(m_inputRoi); // no camera (no ATEM): zone of the input picture
     m_previewOverlay->setCheckerCorners({});
 }
 
@@ -2626,9 +2764,14 @@ void MainWindow::onGrayRoiEdited(const QRectF &roi)
         if (camera.binding.atemId == id) {
             camera.grayRoi = roi;
             saveCameraRois();
-            break;
+            if (m_scopeDocks)
+                m_scopeDocks->requestRefresh(); // scopes follow the new zone at once
+            return;
         }
     }
+    m_inputRoi = roi;
+    if (m_scopeDocks)
+        m_scopeDocks->requestRefresh();
 }
 
 void MainWindow::onCheckerRoiEdited(const QVector<QPointF> &corners)
@@ -3335,6 +3478,19 @@ void MainWindow::closeEvent(QCloseEvent *event)
     QMainWindow::closeEvent(event);
 }
 
+QRectF MainWindow::scopeZone() const
+{
+    if (!m_previewOverlay)
+        return {};
+    if (m_tuningMode == ColorMatchMode::ColorChecker) {
+        const QVector<QPointF> q = m_previewOverlay->checkerCorners();
+        if (q.size() == 4)
+            return QPolygonF(q).boundingRect();
+        return {};
+    }
+    return m_previewOverlay->grayRoi();
+}
+
 void MainWindow::onScopeComputeRequested()
 {
     if (!m_scopeWorker || !m_scopeDocks || m_closing.load())
@@ -3350,6 +3506,11 @@ void MainWindow::onScopeComputeRequested()
     req.plotWidth = pending.plotWidth;
     req.plotHeight = pending.plotHeight;
     req.compareWipe = pending.compareWipe;
+    // Scopes measure the zone shown on the preview (grey rect or the chart quad's bounds); the
+    // comparison frame (reference camera) uses the reference camera's own zone.
+    req.roiA = scopeZone();
+    if (m_referenceFrameImage.isNull() && m_referenceIndex >= 0 && m_referenceIndex < m_cameras.size())
+        req.roiB = m_cameras.at(m_referenceIndex).grayRoi;
     for (const ScopeDockInstance &inst : pending.instruments) {
         ScopeInstrumentJob job;
         job.instanceId = inst.id;

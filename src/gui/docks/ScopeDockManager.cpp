@@ -11,7 +11,12 @@
 
 #include <QDateTime>
 #include <QDockWidget>
+#include <QHBoxLayout>
+#include <QLabel>
 #include <QMainWindow>
+#include <QMenu>
+#include <QStyle>
+#include <QToolButton>
 #include <QUuid>
 
 namespace {
@@ -31,6 +36,51 @@ int countKind(const QVector<ScopeDockInstance> &list, ScopeKind kind)
     }
     return n;
 }
+
+/** Dock title bar: the title is a dropdown of all instruments (swap in place), plus float / close. */
+class InstrumentTitleBar final : public QWidget
+{
+public:
+    InstrumentTitleBar(QDockWidget *dock, const std::function<void(ScopeKind)> &onPick)
+        : QWidget(dock)
+    {
+        auto *lay = new QHBoxLayout(this);
+        lay->setContentsMargins(4, 1, 2, 1);
+        lay->setSpacing(2);
+        m_title = new QToolButton(this);
+        m_title->setPopupMode(QToolButton::InstantPopup);
+        m_title->setToolButtonStyle(Qt::ToolButtonTextOnly);
+        m_title->setAutoRaise(true);
+        m_title->setToolTip(QStringLiteral("Нажмите, чтобы заменить прибор в этой панели"));
+        m_title->setStyleSheet(QStringLiteral("QToolButton{padding:1px 4px;} QToolButton::menu-indicator{image:none;width:0px;}"));
+        auto *menu = new QMenu(m_title);
+        for (ScopeKind k : allScopeKinds()) {
+            QAction *a = menu->addAction(scopeKindLabel(k));
+            QObject::connect(a, &QAction::triggered, this, [onPick, k] { onPick(k); });
+        }
+        m_title->setMenu(menu);
+        lay->addWidget(m_title);
+        lay->addStretch(1);
+        auto *flt = new QToolButton(this);
+        flt->setAutoRaise(true);
+        flt->setIcon(style()->standardIcon(QStyle::SP_TitleBarNormalButton));
+        flt->setToolTip(QStringLiteral("Открепить / закрепить"));
+        QObject::connect(flt, &QToolButton::clicked, dock, [dock] { dock->setFloating(!dock->isFloating()); });
+        lay->addWidget(flt);
+        auto *cls = new QToolButton(this);
+        cls->setAutoRaise(true);
+        cls->setIcon(style()->standardIcon(QStyle::SP_TitleBarCloseButton));
+        cls->setToolTip(QStringLiteral("Закрыть"));
+        QObject::connect(cls, &QToolButton::clicked, dock, &QDockWidget::close);
+        lay->addWidget(cls);
+        setText(dock->windowTitle());
+        QObject::connect(dock, &QDockWidget::windowTitleChanged, this, [this](const QString &t) { setText(t); });
+    }
+    void setText(const QString &t) { m_title->setText(t + QStringLiteral("  ") + QChar(0x25BE)); }
+
+private:
+    QToolButton *m_title = nullptr;
+};
 
 } // namespace
 
@@ -79,27 +129,57 @@ void ScopeDockManager::clearInstruments()
     m_instances.clear();
 }
 
+QWidget *ScopeDockManager::createContent(ScopeDockInstance &inst, const ScopeDisplaySettings *settings)
+{
+    inst.widget = nullptr;
+    if (inst.kind == ScopeKind::AiTips) {
+        inst.content = m_aiTipsFactory ? m_aiTipsFactory() : new QLabel(QStringLiteral("ИИ-подсказки недоступны"));
+        return inst.content;
+    }
+    inst.widget = new ScopeInstrumentWidget(inst.id, inst.kind);
+    if (settings)
+        inst.settings = *settings;
+    else if (inst.settings.refreshFps <= 0)
+        inst.settings.refreshFps = m_refreshFps;
+    inst.widget->settings() = inst.settings;
+    connect(inst.widget, &ScopeInstrumentWidget::settingsRequested, this, &ScopeDockManager::instrumentSettings);
+    connect(inst.widget, &ScopeInstrumentWidget::wipeChanged, this, [this](float) { queueCompute(); });
+    inst.content = inst.widget;
+    return inst.content;
+}
+
+void ScopeDockManager::installTitleBar(ScopeDockInstance &inst)
+{
+    const QString id = inst.id;
+    inst.dock->setTitleBarWidget(new InstrumentTitleBar(inst.dock, [this, id](ScopeKind k) {
+        // queued: the menu that triggered this belongs to the title bar of the dock being changed
+        QMetaObject::invokeMethod(this, [this, id, k] { replaceInstrument(id, k); }, Qt::QueuedConnection);
+    }));
+}
+
 void ScopeDockManager::addInstrument(ScopeKind kind, const QString &instanceId, const ScopeDisplaySettings *settings)
 {
     if (!m_window || kind == ScopeKind::None)
         return;
+    if (kind == ScopeKind::AiTips) {
+        for (ScopeDockInstance &other : m_instances)
+            if (other.kind == ScopeKind::AiTips && other.dock) { // one panel is enough
+                other.dock->show();
+                other.dock->raise();
+                return;
+            }
+    }
     ScopeDockInstance inst;
     inst.id = (instanceId.isEmpty() || find(instanceId)) ? newInstanceId() : instanceId;
     inst.kind = kind;
-    inst.widget = new ScopeInstrumentWidget(inst.id, kind);
-    if (settings)
-        inst.settings = *settings;
-    else
-        inst.settings.refreshFps = m_refreshFps;
-    inst.widget->settings() = inst.settings;
+    inst.settings.refreshFps = m_refreshFps;
+    createContent(inst, settings);
     const int serial = countKind(m_instances, kind) + 1;
     inst.dock = new QDockWidget(dockTitle(kind, serial), m_window);
     styleDock(inst.dock);
     inst.dock->setObjectName(QStringLiteral("scope_%1_%2").arg(scopeKindId(kind), inst.id));
-    inst.dock->setWidget(inst.widget);
-    connect(inst.widget, &ScopeInstrumentWidget::settingsRequested, this,
-            &ScopeDockManager::instrumentSettings);
-    connect(inst.widget, &ScopeInstrumentWidget::wipeChanged, this, [this](float) { queueCompute(); });
+    inst.dock->setWidget(inst.content);
+    installTitleBar(inst);
     connect(inst.dock, &QDockWidget::destroyed, this, &ScopeDockManager::onDockClosed);
     m_instances.push_back(inst);
     m_window->addDockWidget(Qt::RightDockWidgetArea, inst.dock);
@@ -109,6 +189,50 @@ void ScopeDockManager::addInstrument(ScopeKind kind, const QString &instanceId, 
             m_window->splitDockWidget(prev, inst.dock, Qt::Vertical);
     }
     queueCompute();
+}
+
+void ScopeDockManager::replaceInstrument(const QString &instanceId, ScopeKind kind)
+{
+    ScopeDockInstance *inst = find(instanceId);
+    if (!inst || !inst->dock || kind == ScopeKind::None || kind == inst->kind)
+        return;
+    if (kind == ScopeKind::AiTips) {
+        // only one «ИИ-подсказки» panel: the other one is closed, this dock takes its place
+        for (int i = 0; i < m_instances.size(); ++i)
+            if (m_instances.at(i).kind == ScopeKind::AiTips && m_instances.at(i).id != instanceId) {
+                QDockWidget *d = m_instances.at(i).dock;
+                m_instances.removeAt(i);
+                if (d) {
+                    disconnect(d, nullptr, this, nullptr);
+                    m_window->removeDockWidget(d);
+                    d->deleteLater();
+                }
+                break;
+            }
+        inst = find(instanceId);
+        if (!inst)
+            return;
+    }
+    QWidget *old = inst->content;
+    inst->kind = kind;
+    ScopeDisplaySettings keep = inst->widget ? inst->widget->settings() : inst->settings;
+    createContent(*inst, &keep);
+    inst->dock->setWidget(inst->content);
+    if (old)
+        old->deleteLater();
+    inst->dock->setObjectName(QStringLiteral("scope_%1_%2").arg(scopeKindId(kind), inst->id));
+    int serial = 0;
+    for (const ScopeDockInstance &o : m_instances) {
+        if (o.kind == kind)
+            ++serial;
+        if (o.id == instanceId)
+            break;
+    }
+    inst->dock->setWindowTitle(dockTitle(kind, qMax(1, serial)));
+    updatePreviewOverlay();
+    queueCompute();
+    saveCustomLayout(sessionLayoutName());
+    AtemAppSettings::setMainWindowDockState(saveWindowState());
 }
 
 ScopeDockInstance *ScopeDockManager::find(const QString &id)
@@ -222,7 +346,7 @@ void ScopeDockManager::queueCompute()
 void ScopeDockManager::onInstrumentResult(const QString &instanceId, const QImage &image, ScopeKind kind)
 {
     ScopeDockInstance *inst = find(instanceId);
-    if (!inst || !inst->widget)
+    if (!inst || !inst->widget || inst->kind != kind) // late result for a swapped instrument
         return;
     inst->widget->setScopeImage(image);
     ++m_scopeFrames;

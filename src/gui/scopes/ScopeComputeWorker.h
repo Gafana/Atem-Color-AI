@@ -3,6 +3,7 @@
 #include "scopes/ScopeTypes.h"
 
 #include <QImage>
+#include <QRectF>
 #include <QObject>
 #include <QString>
 #include <QSize>
@@ -26,6 +27,10 @@ struct ScopeComputeRequest
     int plotWidth = 640;
     int plotHeight = 360;
     float compareWipe = 0.5f;
+    /** Measurement zones (normalized). Empty = whole frame. All scopes are computed from the zone only;
+     *  false colour / zebra keep the whole picture but dim everything outside the zone. */
+    QRectF roiA;
+    QRectF roiB;
 };
 
 Q_DECLARE_METATYPE(ScopeComputeRequest)

@@ -21,6 +21,7 @@ enum class ScopeKind
     Cie1931,
     CompareWipe,
     CompareSideBySide,
+    AiTips, ///< not a scope image: the «ИИ-подсказки» panel (frame analysis + recommendations)
 };
 
 enum class ScopeLayoutId

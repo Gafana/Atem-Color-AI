@@ -1,6 +1,8 @@
 #pragma once
 
+#include <QColor>
 #include <QImage>
+#include <QString>
 #include <QRectF>
 #include <QVector>
 #include <QWidget>
@@ -28,6 +30,15 @@ public:
     void setCheckerCorners(const QVector<QPointF> &corners);
     QVector<QPointF> checkerCorners() const;
 
+    /** «ИИ-подсказки»: problem areas drawn over the picture (normalized coords), dashed + caption. */
+    struct Mark
+    {
+        QRectF rect;
+        QColor color;
+        QString text;
+    };
+    void setAdviceMarks(const QVector<Mark> &marks);
+
 Q_SIGNALS:
     void grayRoiEdited(const QRectF &roi);
     void checkerCornersEdited(const QVector<QPointF> &corners);
@@ -54,4 +65,5 @@ private:
     QPointF m_dragStart;
     QPointF m_dragCurrent;
     int m_cornerDrag = -1;
+    QVector<Mark> m_marks;
 };

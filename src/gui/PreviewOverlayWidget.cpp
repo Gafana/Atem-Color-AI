@@ -1,6 +1,8 @@
 #include "PreviewOverlayWidget.h"
 
 #include <QMouseEvent>
+#include <QFont>
+#include <QFontMetrics>
 #include <QPainter>
 #include <QtMath>
 
@@ -79,6 +81,12 @@ QPointF PreviewOverlayWidget::mapFromWidget(const QPoint &pos) const
     return QPointF(qBound(0.0, (pos.x() - ir.x()) / ir.width(), 1.0), qBound(0.0, (pos.y() - ir.y()) / ir.height(), 1.0));
 }
 
+void PreviewOverlayWidget::setAdviceMarks(const QVector<Mark> &marks)
+{
+    m_marks = marks;
+    update();
+}
+
 void PreviewOverlayWidget::paintEvent(QPaintEvent *event)
 {
     Q_UNUSED(event);
@@ -99,6 +107,27 @@ void PreviewOverlayWidget::paintEvent(QPaintEvent *event)
     } else {
         painter.setPen(QColor(160, 160, 160));
         painter.drawText(rect(), Qt::AlignCenter, QStringLiteral("Нет кадра"));
+    }
+
+    if (!m_image.isNull() && !m_marks.isEmpty()) {
+        QFont f = painter.font();
+        f.setPixelSize(12);
+        painter.setFont(f);
+        for (const Mark &m : m_marks) {
+            const QRectF r = toWidget(m.rect).adjusted(1, 1, -1, -1);
+            painter.setPen(QPen(m.color, 2, Qt::DashLine));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawRect(r);
+            if (!m.text.isEmpty()) {
+                const QRectF tr = painter.fontMetrics().boundingRect(m.text).adjusted(-3, -1, 3, 1);
+                QRectF box(r.left(), r.top() - tr.height(), tr.width(), tr.height());
+                if (box.top() < 0)
+                    box.moveTop(r.top());
+                painter.fillRect(box, QColor(0, 0, 0, 180));
+                painter.setPen(m.color);
+                painter.drawText(box, Qt::AlignCenter, m.text);
+            }
+        }
     }
 
     // Outline only (no fill: the picture under the zone must stay readable).
