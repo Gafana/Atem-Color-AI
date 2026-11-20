@@ -136,6 +136,12 @@ private:
     };
 
     void rebuildAtemAvailabilityUi();
+    /** Control backend: ATEM switcher or vMix (one at a time, chosen in the source panel). */
+    bool isVmixMode() const;
+    QString backendLabel() const; ///< "ATEM" / "vMix"
+    bool controlAvailable() const; ///< ATEM: ATEM Software Control path ok; vMix: always
+    void switchBackend(const QString &backend);
+    void applyBackendUi();
     void openSettingsDialog();
     void openAdvancedSettingsDialog();
     void connectAtem(bool persistIp);
@@ -193,6 +199,9 @@ private:
     void updateStreamStatusLabel();
 
     std::unique_ptr<AtemClient> m_client;
+    std::unique_ptr<AtemClient> m_parkedClient; ///< the other backend's client (not connected)
+    QString m_backend = QStringLiteral("atem");
+    QString m_atemIp;
     QVector<AtemInputInfo> m_inputs;
     QVector<AtemAuxOutput> m_auxes;
     QVector<VideoDevice> m_devices;
@@ -210,6 +219,10 @@ private:
     std::atomic<bool> m_closing{false};
 
     QLineEdit *m_ipEdit = nullptr;
+    QComboBox *m_backendCombo = nullptr;
+    QLabel *m_addrLabel = nullptr;
+    QLabel *m_vmixNote = nullptr;
+    QPushButton *m_btnAuxPgm = nullptr;
     QLabel *m_linkStatus = nullptr;
     QLabel *m_videoStatus = nullptr;
     QLabel *m_fpsLabel = nullptr;

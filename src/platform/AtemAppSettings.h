@@ -36,6 +36,17 @@ void markFirstRunCompleted();
 QString sdkPath();
 QString softwareControlPath();
 
+/** Control backend: "atem" (switcher IP) or "vmix" (vMix PC, HTTP Web API). One active at a time. */
+QString controlBackend();
+void setControlBackend(const QString &backend);
+bool isVmixBackend();
+/** vMix address "host[:port]" (default localhost:8088). */
+QString vmixAddress();
+void setVmixAddress(const QString &address);
+/** Last colour correction values sent to vMix inputs (JSON; vMix XML does not document them). */
+QByteArray vmixCcCache();
+void setVmixCcCache(const QByteArray &json);
+
 /** Switcher address stored as settings.ini key atem/ip. */
 QString ip();
 void setIp(const QString &ip);
@@ -51,12 +62,14 @@ void setVideoModeKey(const QString &key);
 QString captureRoute();
 void setCaptureRoute(const QString &route);
 
+/** AUX output (ATEM) or vMix output, stored per backend. */
 qint64 auxOutputId();
 void setAuxOutputId(qint64 id);
 
 QString multiviewLayout();
 void setMultiviewLayout(const QString &layoutId);
 
+/** Camera map, stored per backend (ATEM inputs / vMix input numbers). */
 QVector<CameraBinding> cameraMap();
 void setCameraMap(const QVector<CameraBinding> &rows);
 
