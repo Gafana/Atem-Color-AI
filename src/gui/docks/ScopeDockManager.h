@@ -7,6 +7,8 @@
 #include <QObject>
 #include <QString>
 
+#include <functional>
+
 class QDockWidget;
 class QMainWindow;
 class PreviewOverlayWidget;
@@ -17,7 +19,8 @@ struct ScopeDockInstance
     QString id;
     ScopeKind kind = ScopeKind::None;
     QDockWidget *dock = nullptr;
-    ScopeInstrumentWidget *widget = nullptr;
+    ScopeInstrumentWidget *widget = nullptr; ///< scope image widget (null for the «ИИ-подсказки» panel)
+    QWidget *content = nullptr;              ///< what the dock shows (== widget for scopes)
     ScopeDisplaySettings settings;
     QSize plotSize;
     QImage lastSnapshot;
@@ -38,6 +41,10 @@ public:
     void addInstrument(ScopeKind kind, const QString &instanceId = QString(),
                        const ScopeDisplaySettings *settings = nullptr);
     void removeInstrument(const QString &instanceId);
+    /** Swap the instrument shown in a dock in place (title dropdown); the session layout is saved. */
+    void replaceInstrument(const QString &instanceId, ScopeKind kind);
+    /** Creates the «ИИ-подсказки» panel widget (owned by the dock). */
+    void setAiTipsFactory(std::function<QWidget *()> factory) { m_aiTipsFactory = std::move(factory); }
     QVector<ScopeDockInstance> visibleInstruments() const;
 
     bool takePendingCompute();
@@ -52,6 +59,12 @@ public:
     PendingCompute pendingRequest() const { return m_pending; }
 
     void submitFrame(const QImage &frameA, const QImage &frameB);
+    /** Recompute now (e.g. the measurement zone changed), bypassing the refresh-rate throttle. */
+    void requestRefresh()
+    {
+        m_lastComputeMs = 0;
+        queueCompute();
+    }
     void applyLayoutPreset(const QString &presetId);
     void saveCustomLayout(const QString &name);
     bool loadCustomLayout(const QString &name);
@@ -87,6 +100,9 @@ private:
     void queueCompute();
     void styleDock(QDockWidget *dock);
     void updatePreviewOverlay();
+    QWidget *createContent(ScopeDockInstance &inst, const ScopeDisplaySettings *settings);
+    void installTitleBar(ScopeDockInstance &inst);
+    std::function<QWidget *()> m_aiTipsFactory;
 
     QMainWindow *m_window = nullptr;
     PreviewOverlayWidget *m_preview = nullptr;

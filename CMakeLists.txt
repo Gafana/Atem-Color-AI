@@ -118,6 +118,8 @@ add_library(atem_color STATIC
     src/color/ColorMatching.cpp
     src/color/ColorScience.h
     src/color/ColorScience.cpp
+    src/color/FrameAdvisor.h
+    src/color/FrameAdvisor.cpp
     src/color/ColorCharts.h
     src/color/ColorCharts.cpp
     src/color/MatchEngine.h
@@ -215,6 +217,8 @@ if(ENABLE_GUI)
         src/gui/docks/SnapshotManager.cpp
         src/gui/PreviewOverlayWidget.h
         src/gui/PreviewOverlayWidget.cpp
+        src/gui/AiTipsWidget.h
+        src/gui/AiTipsWidget.cpp
         src/platform/CameraPresetStore.h
         src/platform/CameraPresetStore.cpp
     )
@@ -389,4 +393,9 @@ if(BUILD_TESTING)
     target_link_libraries(tst_scopes PRIVATE atem_color ${QT_TEST_LIBS})
     target_compile_definitions(tst_scopes PRIVATE QT_NO_KEYWORDS)
     add_test(NAME scopes COMMAND tst_scopes)
+
+    add_executable(tst_frameadvisor tests/tst_frameadvisor.cpp)
+    target_link_libraries(tst_frameadvisor PRIVATE atem_color ${QT_TEST_LIBS})
+    target_compile_definitions(tst_frameadvisor PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME frameadvisor COMMAND tst_frameadvisor)
 endif()

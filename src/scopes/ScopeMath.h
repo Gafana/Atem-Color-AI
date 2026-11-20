@@ -1,6 +1,8 @@
 #pragma once
 
 #include <QImage>
+#include <QRect>
+#include <QRectF>
 #include <QtGlobal>
 
 namespace ScopeMath {
@@ -30,5 +32,14 @@ int ireToPlotRow(double ire, int plotHeight, bool ire100);
 
 void normalizeFrameRgb32(QImage &image);
 QImage scaledRgb32(const QImage &image, int maxWidth);
+
+/** Pixel rect of a normalized zone (0..1) inside an image of @p size; empty when the zone is empty or
+ *  covers less than 2x2 pixels. */
+QRect roiPixelRect(const QSize &size, const QRectF &normalizedRoi);
+/** The part of @p image inside the normalized zone; the whole image when no (usable) zone is given. */
+QImage cropToRoi(const QImage &image, const QRectF &normalizedRoi);
+/** Overlay images that cover the whole picture (false colour, zebra): outside the zone the original
+ *  picture is dimmed, so the overlay marks only the measured area. */
+void dimOutsideRoi(QImage &image, const QRectF &normalizedRoi, double keep = 0.25);
 
 } // namespace ScopeMath

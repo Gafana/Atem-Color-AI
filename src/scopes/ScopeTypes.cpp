@@ -29,6 +29,8 @@ QString scopeKindId(ScopeKind kind)
         return QStringLiteral("compare_wipe");
     case ScopeKind::CompareSideBySide:
         return QStringLiteral("compare_sbs");
+    case ScopeKind::AiTips:
+        return QStringLiteral("ai_tips");
     case ScopeKind::None:
         return QStringLiteral("none");
     }
@@ -63,6 +65,8 @@ ScopeKind scopeKindFromId(const QString &id)
         return ScopeKind::CompareWipe;
     if (id == QLatin1String("compare_sbs"))
         return ScopeKind::CompareSideBySide;
+    if (id == QLatin1String("ai_tips"))
+        return ScopeKind::AiTips;
     return ScopeKind::None;
 }
 
@@ -95,6 +99,8 @@ QString scopeKindLabel(ScopeKind kind)
         return QStringLiteral("Сравнение (wipe)");
     case ScopeKind::CompareSideBySide:
         return QStringLiteral("Сравнение (рядом)");
+    case ScopeKind::AiTips:
+        return QStringLiteral("ИИ-подсказки");
     case ScopeKind::None:
         return QStringLiteral("—");
     }
@@ -107,7 +113,7 @@ QVector<ScopeKind> allScopeKinds()
             ScopeKind::RgbOverlayWaveform, ScopeKind::Vectorscope, ScopeKind::HistogramLuma,
             ScopeKind::HistogramRgb,   ScopeKind::HistogramRgbOverlay, ScopeKind::FalseColor,
             ScopeKind::Zebra,          ScopeKind::Cie1931,       ScopeKind::CompareWipe,
-            ScopeKind::CompareSideBySide};
+            ScopeKind::CompareSideBySide, ScopeKind::AiTips};
 }
 
 QString scopeLayoutId(ScopeLayoutId layout)
