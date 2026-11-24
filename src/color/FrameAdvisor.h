@@ -80,4 +80,10 @@ QVector<Issue> compare(const Advice &cam, const Advice &ref, double *deltaE = nu
 
 QString severityLabel(Severity s);
 
+/** vMix control backend: vMix only has input colour correction (Lift/Gamma/Gain, saturation, hue). Advice that
+ *  needs the camera (clipping, crushed blacks, exposure, noise, gain, black picture) is rewritten to
+ *  «в vMix не исправить, крутите камеру: …»; colour advice points to the vMix Gain R/G/B of the input. */
+void adaptForVmix(QVector<Issue> &issues);
+void adaptForVmix(Advice &advice);
+
 } // namespace FrameAdvisor

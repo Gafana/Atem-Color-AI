@@ -486,4 +486,36 @@ QVector<Issue> compare(const Advice &cam, const Advice &ref, double *deltaE)
     return out;
 }
 
+void adaptForVmix(QVector<Issue> &issues)
+{
+    const QString cam = QStringLiteral("В vMix не исправить, крутите камеру: ");
+    for (Issue &is : issues) {
+        const QString c = is.code;
+        if (c == QLatin1String("clip")) {
+            is.advice = cam + QStringLiteral("пересвет обрезан уже в камере — закройте диафрагму / снизьте Gain / ND. ")
+                        + QStringLiteral("(%1)").arg(is.advice);
+        } else if (c == QLatin1String("crush")) {
+            is.advice = cam + QStringLiteral("завал чёрного не вернуть — откройте диафрагму / добавьте света. "
+                                             "Lift Y в vMix только приподнимет чёрное без деталей");
+        } else if (c == QLatin1String("exposure") && !is.advice.startsWith(QLatin1String("Для белого"))
+                   && !is.advice.startsWith(QLatin1String("Сравните"))) {
+            is.advice = cam + is.advice + QStringLiteral(". Gain Y в vMix — только точная подстройка");
+        } else if (c == QLatin1String("noise") || c == QLatin1String("gain") || c == QLatin1String("black")) {
+            is.advice = cam + is.advice;
+            is.advice.replace(QStringLiteral("на AUX"), QStringLiteral("на выход vMix"));
+        } else if (c == QLatin1String("cast") || c == QLatin1String("match_wb")) {
+            is.advice += QStringLiteral(". В vMix: Gain R/G/B входа («Применить» / «Авто до допуска»); "
+                                        "баланс белого K/tint — только на камере");
+        } else if (c == QLatin1String("match_level")) {
+            is.advice = QStringLiteral("В vMix: Gain Y входа («Авто до допуска»); при разнице больше ступени — "
+                                       "диафрагма на камере (в vMix не исправить без шума/пересвета)");
+        }
+    }
+}
+
+void adaptForVmix(Advice &advice)
+{
+    adaptForVmix(advice.issues);
+}
+
 } // namespace FrameAdvisor
